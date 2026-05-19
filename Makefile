@@ -55,20 +55,20 @@ ingest:        ## Download Mordor datasets and index to Elasticsearch
 .PHONY: train score-only enrich
 
 train:         ## Full retrain: fit IF on all events, score, save model
-	$(JUPYTER)/src/models/isolation_forest.py
+	$(JUPYTER)/src/models/model_runner.py --model if
 
 score-only:    ## Incremental: load saved model, score only new events
-	$(JUPYTER)/src/models/isolation_forest.py --score-only
+	$(JUPYTER)/src/models/model_runner.py --model if --score-only
 
 score-since:   ## Score events after a specific timestamp: make score-since SINCE=2020-09-21T00:00:00Z
-	$(JUPYTER)/src/models/isolation_forest.py --score-only --since $(SINCE)
+	$(JUPYTER)/src/models/model_runner.py --model if --score-only --since $(SINCE)
 
 enrich:        ## LLM enrichment sweep (top 50 unenriched anomalies)
 	$(JUPYTER)/src/enrichment/alert_explainer.py --limit 50
 
 # PowerShell:
-#   docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py
-#   docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py --score-only
+#   docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py
+#   docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --score-only
 #   docker exec soc_jupyter python3 /home/jovyan/work/src/enrichment/alert_explainer.py --limit 50
 
 

@@ -56,6 +56,22 @@
 - [x] WINDOWS_SETUP.md: step-by-step Docker Desktop + WSL2 setup, PowerShell equivalents, troubleshooting
 - [x] README.md: complete rewrite — architecture, all scripts, feature table, LLM triage fields, scheduler, Windows note
 
+## Phase 8 — Consolidation (model_runner, dashboard, cron) ✅ COMPLETE
+- [x] src/models/model_runner.py subsumes isolation_forest.py: --model if|ae|ensemble dispatch,
+      ml.anomaly_percentile (percentile rank in batch), ml.top_features (top-3 z-score contributors),
+      ml.routing_decision (tier-1/tier-2/auto-close). ae and ensemble stub with "not yet implemented".
+- [x] isolation_forest.py deleted; all references updated: nightly_retrain.py, Makefile, README,
+      WINDOWS_SETUP.md, CLAUDE.md. tests/test_isolation_forest.py renamed to test_model_runner.py.
+- [x] src/dashboard/app.py: simplified to 2 tabs. Tab 1 (Alert Queue) adds percentile + routing_decision
+      columns and top-feature z-score metrics. Tab 2 (Coverage Gap) is a stub for CALDERA integration.
+      Tabs 3 (Model Metrics) and 4 (Dataset Summary) removed; load_dataset_summary() removed.
+- [x] src/scheduler/nightly_retrain.py: start_scheduler() and APScheduler import removed.
+      Script runs one job and exits. Scheduling moved to soc_cron (ofelia) container in docker-compose.yml.
+- [x] docker-compose.yml: added soc_cron (mcuadros/ofelia) with ofelia.job-exec labels on soc_jupyter.
+      Retrain at 02:00 UTC daily, enrichment sweep at 03:00 UTC Sunday.
+- [x] Test suite: 72/72 unit tests pass (added test_percentiles_in_zero_to_100_range,
+      test_top_features_has_correct_structure); all existing 70 still pass.
+
 ## Current phase: complete
-## Last completed: Phase 7 — Incremental scoring + Windows portability
+## Last completed: Phase 8 — Consolidation
 ## Blockers: none

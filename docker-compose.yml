@@ -42,6 +42,7 @@ services:
   # ── Jupyter Lab ──────────────────────────────────────────────────────────────
   # Built from our custom Dockerfile so the ML stack is baked in at image-build
   # time rather than installed on every container start.
+  # ofelia labels define the cron jobs that soc_cron will exec inside this container.
   jupyter:
     build:
       context: ./docker/jupyter
@@ -63,6 +64,33 @@ services:
         condition: service_healthy
     networks:
       - soc_net
+    labels:
+      # Retrain the IF model every night at 02:00 UTC
+      ofelia.job-exec.retrain.schedule: "0 2 * * *"
+      ofelia.job-exec.retrain.command: >
+        python3 /home/jovyan/work/src/scheduler/nightly_retrain.py
+        --run-now retrain
+      # LLM enrichment sweep every Sunday at 03:00 UTC
+      ofelia.job-exec.enrich.schedule: "0 3 * * 0"
+      ofelia.job-exec.enrich.command: >
+        python3 /home/jovyan/work/src/scheduler/nightly_retrain.py
+        --run-now enrich
+
+  # ── Cron scheduler ───────────────────────────────────────────────────────────
+  # ofelia reads the ofelia.job-exec.* labels on soc_jupyter and exec-s the
+  # commands inside that container on the given cron schedule. The Python
+  # scripts run once and exit — no long-running scheduler process inside Python.
+  cron:
+    image: mcuadros/ofelia:latest
+    container_name: soc_cron
+    command: daemon --docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - jupyter
+    networks:
+      - soc_net
+    restart: unless-stopped
 
   # ── Streamlit dashboard ───────────────────────────────────────────────────────
   # Also built from a custom Dockerfile (slim image, only dashboard deps).

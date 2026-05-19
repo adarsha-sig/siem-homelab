@@ -129,7 +129,7 @@ Expected: `Total: 30,033 documents from 6 files`
 ## Step 7 — Train the model
 
 ```powershell
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if
 ```
 
 Takes ~3 minutes. Writes 30,033 scored documents to `security-scores-if`.
@@ -156,8 +156,8 @@ Every `make` command has a direct PowerShell equivalent. Use whichever you prefe
 | Start stack | `docker compose up -d` |
 | Stop stack | `docker compose down` |
 | View logs | `docker compose logs -f` |
-| Full retrain | `docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py` |
-| Score-only (new events) | `docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py --score-only` |
+| Full retrain | `docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if` |
+| Score-only (new events) | `docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if --score-only` |
 | Dry-run retrain | `docker exec soc_jupyter python3 /home/jovyan/work/src/scheduler/nightly_retrain.py --run-now retrain --dry-run` |
 | LLM enrichment | `docker exec soc_jupyter python3 /home/jovyan/work/src/enrichment/alert_explainer.py --limit 50` |
 | Unit tests | `python -m pytest tests/ -v -m "not integration"` |

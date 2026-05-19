@@ -1,12 +1,12 @@
 """
-Tests for feature_engineering.py and isolation_forest.py.
+Tests for feature_engineering.py and model_runner.py (IF backend).
 
 Unit tests use synthetic event dicts — no Elasticsearch required.
 Integration tests (marked with @pytest.mark.integration) require a running
 ES cluster and the security-events-mordor index to be populated.
 
-Run unit tests only:   pytest tests/test_isolation_forest.py -v
-Run integration tests: pytest tests/test_isolation_forest.py -v -m integration
+Run unit tests only:   pytest tests/test_model_runner.py -v
+Run integration tests: pytest tests/test_model_runner.py -v -m integration
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from src.models.feature_engineering import (
     build_frequency_tables,
     extract_row,
 )
-from src.models.isolation_forest import compute_scores, train
+from src.models.model_runner import compute_scores, train
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -189,19 +189,35 @@ class TestTrainAndScore:
 
     def test_scores_in_zero_one_range(self):
         model, scaler = train(self.X, contamination=0.1)
-        scores, _ = compute_scores(model, scaler, self.X)
+        scores, _, percentiles, top_feats = compute_scores(model, scaler, self.X)
         assert scores.min() >= 0.0
         assert scores.max() <= 1.0
 
+    def test_percentiles_in_zero_to_100_range(self):
+        model, scaler = train(self.X, contamination=0.1)
+        _, _, percentiles, _ = compute_scores(model, scaler, self.X)
+        assert percentiles.min() >= 0.0
+        assert percentiles.max() <= 100.0
+
+    def test_top_features_has_correct_structure(self):
+        model, scaler = train(self.X, contamination=0.1)
+        _, _, _, top_feats = compute_scores(model, scaler, self.X)
+        assert len(top_feats) == len(SYNTHETIC_EVENTS)
+        for row in top_feats:
+            assert len(row) == 3
+            for item in row:
+                assert "feature" in item
+                assert "z_score" in item
+
     def test_is_anomaly_is_boolean_array(self):
         model, scaler = train(self.X, contamination=0.1)
-        _, is_anom = compute_scores(model, scaler, self.X)
+        _, is_anom, _, _ = compute_scores(model, scaler, self.X)
         assert is_anom.dtype == bool
 
     def test_anomaly_count_matches_contamination(self):
         contamination = 0.2
         model, scaler = train(self.X, contamination=contamination)
-        _, is_anom = compute_scores(model, scaler, self.X)
+        _, is_anom, _, _ = compute_scores(model, scaler, self.X)
         expected = int(len(SYNTHETIC_EVENTS) * contamination)
         # sklearn IF guarantees exactly floor(contamination * n) anomalies
         assert int(is_anom.sum()) == expected
@@ -212,7 +228,7 @@ class TestTrainAndScore:
         should score higher than svchost.exe (common, no command line).
         """
         model, scaler = train(self.X, contamination=0.1)
-        scores, _    = compute_scores(model, scaler, self.X)
+        scores, _, _, _ = compute_scores(model, scaler, self.X)
         mimikatz_idx = 9   # SYNTHETIC_EVENTS[9] = mimikatz.exe
         svchost_idx  = 5   # SYNTHETIC_EVENTS[5] = svchost.exe
         assert scores[mimikatz_idx] >= scores[svchost_idx], (
@@ -225,44 +241,44 @@ class TestTrainAndScore:
 
 class TestGetLastRetrainTime:
     def test_returns_none_when_runs_dir_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path / "nonexistent")
-        from src.models.isolation_forest import get_last_retrain_time
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path / "nonexistent")
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() is None
 
     def test_returns_none_when_no_retrain_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
-        from src.models.isolation_forest import get_last_retrain_time
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() is None
 
     def test_returns_none_when_only_dry_run_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
         (tmp_path / "retrain_20240519_020000.json").write_text(
             '{"dry_run": true, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
             encoding="utf-8",
         )
-        from src.models.isolation_forest import get_last_retrain_time
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() is None
 
     def test_returns_none_when_run_had_errors(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
         (tmp_path / "retrain_20240519_020000.json").write_text(
             '{"dry_run": false, "errors": ["boom"], "completed_at": "2024-05-19T02:01:00Z"}',
             encoding="utf-8",
         )
-        from src.models.isolation_forest import get_last_retrain_time
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() is None
 
     def test_returns_completed_at_from_valid_run(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
         (tmp_path / "retrain_20240519_020000.json").write_text(
             '{"dry_run": false, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
             encoding="utf-8",
         )
-        from src.models.isolation_forest import get_last_retrain_time
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
 
     def test_returns_most_recent_when_multiple_files(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
         good = '{"dry_run": false, "errors": [], "completed_at": "%s"}'
         (tmp_path / "retrain_20240518_020000.json").write_text(
             good % "2024-05-18T02:01:00Z", encoding="utf-8"
@@ -270,26 +286,26 @@ class TestGetLastRetrainTime:
         (tmp_path / "retrain_20240519_020000.json").write_text(
             good % "2024-05-19T02:01:00Z", encoding="utf-8"
         )
-        from src.models.isolation_forest import get_last_retrain_time
+        from src.models.model_runner import get_last_retrain_time
         # Should return the most recent
         assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
 
     def test_skips_malformed_json(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
         (tmp_path / "retrain_20240518_020000.json").write_text("{not json}", encoding="utf-8")
         (tmp_path / "retrain_20240519_020000.json").write_text(
             '{"dry_run": false, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
             encoding="utf-8",
         )
-        from src.models.isolation_forest import get_last_retrain_time
+        from src.models.model_runner import get_last_retrain_time
         assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
 
 
 class TestScoreOnlyRun:
     def test_score_only_raises_without_saved_model(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("src.models.isolation_forest.MODELS_DIR", tmp_path)
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
-        from src.models.isolation_forest import run
+        monkeypatch.setattr("src.models.model_runner.MODELS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path)
+        from src.models.model_runner import run
         with pytest.raises(RuntimeError, match="No saved model"):
             run(score_only=True, since="2024-01-01T00:00:00Z", dry_run=True)
 
@@ -304,9 +320,9 @@ class TestScoreOnlyRun:
                 {"model": IsolationForest(), "scaler": StandardScaler(), "feature_names": []},
                 f,
             )
-        monkeypatch.setattr("src.models.isolation_forest.MODELS_DIR", tmp_path)
-        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path / "empty_runs")
-        from src.models.isolation_forest import run
+        monkeypatch.setattr("src.models.model_runner.MODELS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.model_runner.RUNS_DIR", tmp_path / "empty_runs")
+        from src.models.model_runner import run
         with pytest.raises(RuntimeError, match="Cannot determine the scoring window"):
             run(score_only=True, dry_run=True)
 
@@ -317,12 +333,12 @@ class TestScoreOnlyRun:
 class TestIntegration:
     """
     These tests hit real Elasticsearch. Run with:
-        pytest tests/test_isolation_forest.py -v -m integration
+        pytest tests/test_model_runner.py -v -m integration
     """
 
     def test_scores_index_created_and_populated(self):
         from elasticsearch import Elasticsearch
-        from src.models.isolation_forest import SCORES_INDEX, run
+        from src.models.model_runner import SCORES_INDEX, run
 
         summary = run(dry_run=False, verbose=False, contamination=0.05)
 
@@ -337,7 +353,7 @@ class TestIntegration:
     def test_top_anomalies_have_ml_fields(self):
         import os
         from elasticsearch import Elasticsearch
-        from src.models.isolation_forest import SCORES_INDEX
+        from src.models.model_runner import SCORES_INDEX
 
         client = Elasticsearch(os.getenv("ELASTIC_URL", "http://localhost:9200"))
         resp   = client.search(

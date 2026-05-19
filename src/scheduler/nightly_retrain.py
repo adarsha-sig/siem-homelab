@@ -1,25 +1,21 @@
 """
-Nightly retrain scheduler for the SOC ML Lab.
+Nightly retrain and enrichment jobs for the SOC ML Lab.
 
-Runs two recurring jobs:
-  • Daily at 02:00 UTC   — retrain the Isolation Forest, re-score all events,
-                           save the model, write a JSON audit record.
-  • Weekly on Sunday 03:00 UTC — LLM enrichment sweep (enrich any anomaly
-                           that does not yet have ml.llm_triage).
+This script runs ONE job then exits. Scheduling is handled externally by the
+soc_cron container (mcuadros/ofelia) defined in docker-compose.yml — no
+APScheduler or long-running daemon here. Each invocation is a clean process
+with no persistent state, which makes it trivial to test, restart, and audit.
 
-Security intuition: retraining nightly keeps the anomaly baseline current.
-As new log sources are ingested the feature frequency tables shift, so a model
-trained last week may score today's events incorrectly. The weekly enrichment
-sweep ensures that every flagged alert eventually gets an ATT&CK mapping and
-investigation steps, even when the CPU-bound LLM inference lags behind
-real-time alert volume.
+Jobs:
+  retrain  — Retrain the Isolation Forest on all indexed events, score, save
+             model, and write a JSON audit record to data/runs/.
+  enrich   — LLM enrichment sweep: enrich up to N unenriched anomalies.
 
 Usage:
-  python src/scheduler/nightly_retrain.py                    # start scheduler (blocking)
-  python src/scheduler/nightly_retrain.py --dry-run          # scheduler + dry-run jobs
-  python src/scheduler/nightly_retrain.py --run-now retrain  # fire retrain immediately
-  python src/scheduler/nightly_retrain.py --run-now enrich   # fire enrichment immediately
-  python src/scheduler/nightly_retrain.py --run-now all      # fire both immediately
+  python src/scheduler/nightly_retrain.py --run-now retrain
+  python src/scheduler/nightly_retrain.py --run-now enrich
+  python src/scheduler/nightly_retrain.py --run-now all
+  python src/scheduler/nightly_retrain.py --run-now retrain --dry-run
 """
 
 from __future__ import annotations
@@ -33,7 +29,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Configure logging before any src/ imports so that isolation_forest.py's
+# Configure logging before any src/ imports so that model_runner.py's
 # module-level logging.basicConfig() call is a no-op (handlers already set).
 logging.basicConfig(
     level=logging.INFO,
@@ -105,7 +101,7 @@ def run_retrain(dry_run: bool = False, verbose: bool = False) -> dict:
 
     Note on window_days: SPEC says 'fetch 7-day window'. For the Mordor
     historical dataset all events are from 2020, so a time filter would
-    return nothing. isolation_forest.run() fetches all indexed events.
+    return nothing. model_runner.run() fetches all indexed events.
     In a production deployment with a live log stream, add a date-range
     filter to fetch_events() here.
     """
@@ -115,8 +111,8 @@ def run_retrain(dry_run: bool = False, verbose: bool = False) -> dict:
     result: dict = {}
 
     try:
-        from src.models.isolation_forest import run as if_run
-        result = if_run(dry_run=dry_run, verbose=verbose)
+        from src.models.model_runner import run as model_run
+        result = model_run(model="if", dry_run=dry_run, verbose=verbose)
     except Exception:
         msg = traceback.format_exc()
         log.error("Retrain failed:\n%s", msg)
@@ -182,74 +178,30 @@ def run_enrichment_sweep(
     return summary
 
 
-# ── Scheduler setup ───────────────────────────────────────────────────────────
-
-def start_scheduler(dry_run: bool = False, verbose: bool = False) -> None:
-    """
-    Start the blocking APScheduler with cron triggers for both jobs.
-
-    The scheduler runs in the foreground so Docker can manage it as a
-    container process and capture all log output via docker compose logs.
-    Both jobs are also fired once at startup so the operator can verify
-    they work without waiting until 02:00 UTC.
-    """
-    from apscheduler.schedulers.blocking import BlockingScheduler
-    from apscheduler.triggers.cron import CronTrigger
-
-    scheduler = BlockingScheduler(timezone="UTC")
-
-    scheduler.add_job(
-        run_retrain,
-        trigger=CronTrigger(hour=2, minute=0),
-        kwargs={"dry_run": dry_run, "verbose": verbose},
-        id="nightly_retrain",
-        name="Nightly IF retrain + scoring",
-        replace_existing=True,
-        misfire_grace_time=3600,    # tolerate up to 1 h clock drift
-    )
-    scheduler.add_job(
-        run_enrichment_sweep,
-        trigger=CronTrigger(day_of_week="sun", hour=3, minute=0),
-        kwargs={"dry_run": dry_run, "verbose": verbose,
-                "limit": ENRICH_LIMIT, "model": ENRICH_MODEL},
-        id="weekly_enrichment",
-        name="Weekly LLM enrichment sweep",
-        replace_existing=True,
-        misfire_grace_time=7200,
-    )
-
-    log.info(
-        "Scheduler started — retrain daily@02:00 UTC, "
-        "enrichment weekly Sun@03:00 UTC (dry_run=%s)",
-        dry_run,
-    )
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Scheduler stopped.")
-
-
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SOC ML Lab nightly retrain and enrichment scheduler."
+        description=(
+            "Run a single SOC ML Lab job then exit. "
+            "Scheduling is handled by the soc_cron container (ofelia) in docker-compose.yml."
+        )
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Run the full pipeline but skip ES writes and model saves. "
+        help="Run the pipeline but skip ES writes and model saves. "
              "The JSON audit file IS written so you can verify the format.",
     )
     parser.add_argument(
         "--verbose", action="store_true",
-        help="Pass --verbose to retrain and enrichment sub-jobs.",
+        help="Pass --verbose to sub-jobs.",
     )
     parser.add_argument(
         "--run-now",
         choices=["retrain", "enrich", "all"],
+        default="retrain",
         metavar="JOB",
-        help="Fire a job immediately instead of waiting for the cron schedule. "
-             "Choices: retrain, enrich, all.",
+        help="Job to run: retrain, enrich, or all (default: retrain).",
     )
     parser.add_argument(
         "--enrich-limit", type=int, default=ENRICH_LIMIT, metavar="N",
@@ -261,20 +213,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.run_now:
-        if args.run_now in ("retrain", "all"):
-            summary = run_retrain(dry_run=args.dry_run, verbose=args.verbose)
-            print(json.dumps(summary, indent=2, default=str))
-        if args.run_now in ("enrich", "all"):
-            summary = run_enrichment_sweep(
-                dry_run=args.dry_run,
-                verbose=args.verbose,
-                limit=args.enrich_limit,
-                model=args.enrich_model,
-            )
-            print(json.dumps(summary, indent=2, default=str))
-    else:
-        start_scheduler(dry_run=args.dry_run, verbose=args.verbose)
+    if args.run_now in ("retrain", "all"):
+        summary = run_retrain(dry_run=args.dry_run, verbose=args.verbose)
+        print(json.dumps(summary, indent=2, default=str))
+    if args.run_now in ("enrich", "all"):
+        summary = run_enrichment_sweep(
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            limit=args.enrich_limit,
+            model=args.enrich_model,
+        )
+        print(json.dumps(summary, indent=2, default=str))
 
     sys.exit(0)
 

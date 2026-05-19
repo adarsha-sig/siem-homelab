@@ -1,10 +1,10 @@
 """
 SOC ML Lab — Streamlit dashboard.
 
-Four panels (as tabs):
-  1. Alert Queue   — sortable anomaly table; click a row to see LLM triage
-  2. Model Metrics — score distribution, anomaly rate by category
-  3. Dataset Summary — event counts by dataset and category
+Two tabs:
+  1. Alert Queue     — sortable anomaly table with percentile + routing columns;
+                       click a row to see LLM triage inline.
+  2. Coverage Gap    — stub panel for future CALDERA adversary emulation coverage.
 
 Run: streamlit run src/dashboard/app.py
      (or via docker-compose: http://localhost:8501)
@@ -18,15 +18,14 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 from elasticsearch import Elasticsearch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-ES_URL        = os.getenv("ELASTIC_URL", "http://localhost:9200")
-SCORES_INDEX  = "security-scores-if"
-REFRESH_SEC   = 60
+ES_URL       = os.getenv("ELASTIC_URL", "http://localhost:9200")
+SCORES_INDEX = "security-scores-if"
+REFRESH_SEC  = 60
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -51,10 +50,8 @@ def get_client() -> Elasticsearch:
 @st.cache_data(ttl=REFRESH_SEC)
 def load_alert_queue(threshold: float, limit: int) -> tuple[list[dict], pd.DataFrame]:
     """
-    Fetch scored events above the threshold, return raw hits + flat DataFrame.
-
-    Raw hits are needed so the triage panel can access ml.llm_triage without
-    a second ES round-trip. The flat DataFrame is what st.dataframe renders.
+    Fetch scored events above the threshold. Returns raw hits (for the triage
+    panel) and a flat DataFrame (for st.dataframe rendering).
     """
     client = get_client()
     try:
@@ -68,7 +65,9 @@ def load_alert_queue(threshold: float, limit: int) -> tuple[list[dict], pd.DataF
                     "@timestamp", "host.name", "user.name",
                     "process.name", "process.parent.name", "process.command_line",
                     "event.category", "event.channel", "source_dataset",
-                    "ml.anomaly_score", "ml.is_anomaly", "ml.enriched", "ml.llm_triage",
+                    "ml.anomaly_score", "ml.anomaly_percentile",
+                    "ml.is_anomaly", "ml.routing_decision",
+                    "ml.enriched", "ml.llm_triage", "ml.top_features",
                 ],
             },
         )
@@ -88,26 +87,25 @@ def load_alert_queue(threshold: float, limit: int) -> tuple[list[dict], pd.DataF
         pr  = s.get("process") or {}
         par = pr.get("parent") or {}
         rows.append({
-            "_id":          h["_id"],
-            "score":        round(ml.get("anomaly_score", 0), 4),
-            "is_anomaly":   ml.get("is_anomaly", False),
-            "enriched":     ml.get("enriched", False),
-            "category":     ev.get("category", ""),
-            "process":      pr.get("name", ""),
-            "parent":       par.get("name", ""),
-            "user":         (s.get("user") or {}).get("name", ""),
-            "host":         (s.get("host") or {}).get("name", ""),
-            "dataset":      s.get("source_dataset", ""),
-            "@timestamp":   s.get("@timestamp", ""),
+            "_id":              h["_id"],
+            "score":            round(ml.get("anomaly_score", 0), 4),
+            "percentile":       ml.get("anomaly_percentile"),
+            "routing":          ml.get("routing_decision", "—"),
+            "enriched":         ml.get("enriched", False),
+            "category":         ev.get("category", ""),
+            "process":          pr.get("name", ""),
+            "parent":           par.get("name", ""),
+            "user":             (s.get("user") or {}).get("name", ""),
+            "host":             (s.get("host") or {}).get("name", ""),
+            "dataset":          s.get("source_dataset", ""),
         })
 
-    df = pd.DataFrame(rows)
-    return hits, df
+    return hits, pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=REFRESH_SEC)
-def load_score_distribution() -> dict:
-    """Aggregations for the Model Metrics panel."""
+def load_kpi_stats() -> dict:
+    """Aggregate stats for the KPI row."""
     client = get_client()
     try:
         resp = client.search(
@@ -115,40 +113,9 @@ def load_score_distribution() -> dict:
             body={
                 "size": 0,
                 "aggs": {
-                    "score_hist": {
-                        "histogram": {"field": "ml.anomaly_score", "interval": 0.05}
-                    },
-                    "anomaly_by_category": {
-                        "filter": {"term": {"ml.is_anomaly": True}},
-                        "aggs": {
-                            "cats": {"terms": {"field": "event.category", "size": 20}}
-                        },
-                    },
                     "total_anomalies": {"filter": {"term": {"ml.is_anomaly": True}}},
                     "enriched_count":  {"filter": {"term": {"ml.enriched": True}}},
                     "score_stats":     {"stats": {"field": "ml.anomaly_score"}},
-                },
-            },
-        )
-    except Exception as exc:
-        st.error(f"Elasticsearch error: {exc}")
-        return {}
-    return resp.get("aggregations", {})
-
-
-@st.cache_data(ttl=REFRESH_SEC)
-def load_dataset_summary() -> dict:
-    """Aggregations for the Dataset Summary panel."""
-    client = get_client()
-    try:
-        resp = client.search(
-            index=SCORES_INDEX,
-            body={
-                "size": 0,
-                "aggs": {
-                    "by_dataset":  {"terms": {"field": "source_dataset", "size": 20}},
-                    "by_category": {"terms": {"field": "event.category",  "size": 25}},
-                    "total":       {"value_count": {"field": "ml.anomaly_score"}},
                 },
             },
         )
@@ -165,7 +132,7 @@ with st.sidebar:
 
     threshold = st.slider(
         "Score threshold", 0.0, 1.0, 0.70, 0.05,
-        help="Only show events with anomaly_score ≥ this value.",
+        help="Show events with anomaly_score ≥ this value.",
     )
     alert_limit = st.select_slider(
         "Alerts to load", options=[50, 100, 200, 500], value=100,
@@ -179,7 +146,7 @@ with st.sidebar:
         "Model",
         options=["llama3.2:3b", "llama3.1:8b"],
         index=0,
-        help="3b is faster for real-time triage; 8b gives more accurate ATT&CK technique mapping.",
+        help="3b is faster for real-time triage; 8b gives more accurate ATT&CK mapping.",
     )
 
     st.divider()
@@ -191,19 +158,13 @@ with st.sidebar:
     st.caption(f"ES: `{ES_URL}`")
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+# ── KPI row (always visible) ──────────────────────────────────────────────────
 
-raw_hits, alert_df = load_alert_queue(threshold, alert_limit)
-agg_stats          = load_score_distribution()
-dataset_agg        = load_dataset_summary()
-
-total_events   = (agg_stats.get("score_stats") or {}).get("count", 0)
-total_anomalies = (agg_stats.get("total_anomalies") or {}).get("doc_count", 0)
-enriched_count  = (agg_stats.get("enriched_count") or {}).get("doc_count", 0)
-avg_score       = (agg_stats.get("score_stats") or {}).get("avg", 0) or 0
-
-
-# ── Top KPI row (always visible) ──────────────────────────────────────────────
+kpi = load_kpi_stats()
+total_events    = (kpi.get("score_stats") or {}).get("count", 0)
+total_anomalies = (kpi.get("total_anomalies") or {}).get("doc_count", 0)
+enriched_count  = (kpi.get("enriched_count") or {}).get("doc_count", 0)
+avg_score       = (kpi.get("score_stats") or {}).get("avg", 0) or 0
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total Events",    f"{total_events:,}")
@@ -218,14 +179,14 @@ st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_queue, tab_metrics, tab_datasets = st.tabs(
-    ["🚨 Alert Queue", "📊 Model Metrics", "🗂️ Dataset Summary"]
-)
+tab_queue, tab_coverage = st.tabs(["🚨 Alert Queue", "🗺️ Coverage Gap"])
 
 
 # ══ Tab 1: Alert Queue ════════════════════════════════════════════════════════
 
 with tab_queue:
+    raw_hits, alert_df = load_alert_queue(threshold, alert_limit)
+
     if alert_df.empty:
         st.info(f"No events with score ≥ {threshold:.2f}. Lower the threshold or refresh.")
     else:
@@ -235,9 +196,8 @@ with tab_queue:
         )
 
         display_df = alert_df[[
-            "score", "is_anomaly", "enriched",
-            "category", "process", "parent",
-            "user", "host", "dataset",
+            "score", "percentile", "routing", "enriched",
+            "category", "process", "parent", "user", "host", "dataset",
         ]].copy()
 
         selection = st.dataframe(
@@ -250,7 +210,11 @@ with tab_queue:
                 "score":      st.column_config.ProgressColumn(
                     "Score", min_value=0, max_value=1, format="%.4f", width="small",
                 ),
-                "is_anomaly": st.column_config.CheckboxColumn("Anomaly", width="small"),
+                "percentile": st.column_config.NumberColumn(
+                    "Pctile", format="%.1f", width="small",
+                    help="Percentile rank within the scored batch (100 = most anomalous)",
+                ),
+                "routing":    st.column_config.TextColumn("Routing", width="small"),
                 "enriched":   st.column_config.CheckboxColumn("Triaged", width="small"),
                 "category":   st.column_config.TextColumn("Category"),
                 "process":    st.column_config.TextColumn("Process"),
@@ -261,7 +225,7 @@ with tab_queue:
             },
         )
 
-        # ── LLM Triage panel (shown when a row is selected) ───────────────────
+        # ── LLM Triage panel ──────────────────────────────────────────────────
         selected_rows = selection.selection.rows
         if selected_rows:
             idx = selected_rows[0]
@@ -270,15 +234,28 @@ with tab_queue:
             ml  = src.get("ml") or {}
 
             st.divider()
-            proc  = (src.get("process") or {}).get("name", "unknown")
-            score = ml.get("anomaly_score", 0)
+            proc   = (src.get("process") or {}).get("name", "unknown")
+            score  = ml.get("anomaly_score", 0)
+            pct    = ml.get("anomaly_percentile")
+            pct_str = f"  ·  {pct:.1f}th percentile" if pct is not None else ""
 
-            st.subheader(f"LLM Triage — `{proc}`  (score {score:.4f})")
+            st.subheader(f"LLM Triage — `{proc}`  (score {score:.4f}{pct_str})")
+
+            # Top features (if available from model_runner.py)
+            top_feats = ml.get("top_features")
+            if top_feats:
+                feat_cols = st.columns(min(len(top_feats), 3))
+                for i, feat in enumerate(top_feats[:3]):
+                    feat_cols[i].metric(
+                        feat["feature"],
+                        f"z={feat['z_score']:+.2f}",
+                        help="Signed z-score — how many standard deviations from the training mean. "
+                             "High absolute value = primary driver of the anomaly score.",
+                    )
 
             triage = ml.get("llm_triage")
-
             if triage:
-                fp = triage.get("fp_assessment", "medium").lower()
+                fp        = triage.get("fp_assessment", "medium").lower()
                 fp_colour = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(fp, "⚪")
 
                 col_a, col_b = st.columns([1, 2])
@@ -306,10 +283,10 @@ with tab_queue:
                                 write_triage, client_from_env,
                             )
                             import ollama as _ollama
-                            oc     = _ollama.Client(host=os.getenv("OLLAMA_URL", "http://localhost:11434"))
-                            prompt = build_prompt(src)
-                            raw    = call_llm(prompt, llm_model, oc)
-                            result = parse_response(raw)
+                            oc     = _ollama.Client(
+                                host=os.getenv("OLLAMA_URL", "http://localhost:11434")
+                            )
+                            result = parse_response(call_llm(build_prompt(src), llm_model, oc))
                             if result:
                                 write_triage(client_from_env(), hit["_id"], result)
                                 st.cache_data.clear()
@@ -324,121 +301,56 @@ with tab_queue:
                 ev = src.get("event") or {}
                 pr = src.get("process") or {}
                 st.json({
-                    "@timestamp":     src.get("@timestamp"),
-                    "host":           src.get("host"),
-                    "user":           src.get("user"),
-                    "process.name":   pr.get("name"),
-                    "process.parent": (pr.get("parent") or {}).get("name"),
-                    "process.cmd":    pr.get("command_line"),
-                    "event.category": ev.get("category"),
-                    "event.channel":  ev.get("channel"),
-                    "event.id":       ev.get("id"),
-                    "source_dataset": src.get("source_dataset"),
+                    "@timestamp":       src.get("@timestamp"),
+                    "host":             src.get("host"),
+                    "user":             src.get("user"),
+                    "process.name":     pr.get("name"),
+                    "process.parent":   (pr.get("parent") or {}).get("name"),
+                    "process.cmd":      pr.get("command_line"),
+                    "event.category":   ev.get("category"),
+                    "event.channel":    ev.get("channel"),
+                    "event.id":         ev.get("id"),
+                    "source_dataset":   src.get("source_dataset"),
                     "ml.anomaly_score": score,
-                    "ml.model":       ml.get("model"),
+                    "ml.percentile":    ml.get("anomaly_percentile"),
+                    "ml.routing":       ml.get("routing_decision"),
+                    "ml.model":         ml.get("model"),
+                    "ml.top_features":  top_feats,
                 })
 
 
-# ══ Tab 2: Model Metrics ══════════════════════════════════════════════════════
+# ══ Tab 2: Coverage Gap ═══════════════════════════════════════════════════════
 
-with tab_metrics:
-    if not agg_stats:
-        st.warning("Could not load aggregations from Elasticsearch.")
-    else:
-        # Score distribution histogram
-        hist_buckets = (agg_stats.get("score_hist") or {}).get("buckets", [])
-        if hist_buckets:
-            hist_df = pd.DataFrame(hist_buckets).rename(
-                columns={"key": "Score bucket", "doc_count": "Events"}
-            )
-            fig_hist = px.bar(
-                hist_df, x="Score bucket", y="Events",
-                title="Anomaly Score Distribution",
-                color="Events",
-                color_continuous_scale="Reds",
-                labels={"Score bucket": "Anomaly Score (lower bound)"},
-            )
-            fig_hist.add_vline(
-                x=threshold, line_dash="dash", line_color="crimson",
-                annotation_text=f"threshold {threshold:.2f}",
-                annotation_position="top right",
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
+with tab_coverage:
+    st.subheader("Coverage Gap Analysis")
+    st.info(
+        "**Coming in Phase 8 — CALDERA integration.**\n\n"
+        "This panel will show which ATT&CK techniques were exercised by "
+        "CALDERA adversary emulation and which are NOT yet covered by the "
+        "Isolation Forest model — the 'gap' between what you can simulate "
+        "and what the model actually detects.\n\n"
+        "Planned columns: technique ID · tactic · simulated? · detected? "
+        "· detection rate · top false-negative events."
+    )
 
-        # Anomalies by event category
-        cat_buckets = (
-            (agg_stats.get("anomaly_by_category") or {})
-            .get("cats", {})
-            .get("buckets", [])
-        )
-        if cat_buckets:
-            cat_df = pd.DataFrame(cat_buckets).rename(
-                columns={"key": "Category", "doc_count": "Anomalies"}
-            ).sort_values("Anomalies", ascending=True)
+    # Stub chart — replaced with real CALDERA data in Phase 8
+    import pandas as pd
+    stub = pd.DataFrame({
+        "Tactic":    ["Initial Access", "Execution", "Persistence",
+                      "Privilege Escalation", "Defense Evasion",
+                      "Credential Access", "Lateral Movement"],
+        "Techniques": [3, 8, 5, 4, 7, 6, 4],
+        "Covered":    [0, 3, 0, 1, 2, 4, 2],
+    })
+    stub["Gap"] = stub["Techniques"] - stub["Covered"]
 
-            fig_cat = px.bar(
-                cat_df, x="Anomalies", y="Category",
-                orientation="h",
-                title="Anomalies by Event Category",
-                color="Anomalies",
-                color_continuous_scale="Oranges",
-            )
-            st.plotly_chart(fig_cat, use_container_width=True)
-        else:
-            st.info("No anomaly-by-category data available yet.")
-
-
-# ══ Tab 3: Dataset Summary ════════════════════════════════════════════════════
-
-with tab_datasets:
-    if not dataset_agg:
-        st.warning("Could not load dataset aggregations.")
-    else:
-        col_ds, col_cat = st.columns(2)
-
-        # Events by dataset
-        ds_buckets = (dataset_agg.get("by_dataset") or {}).get("buckets", [])
-        with col_ds:
-            if ds_buckets:
-                ds_df = pd.DataFrame(ds_buckets).rename(
-                    columns={"key": "Dataset", "doc_count": "Events"}
-                ).sort_values("Events", ascending=False)
-                fig_ds = px.bar(
-                    ds_df, x="Dataset", y="Events",
-                    title="Events by ATT&CK Dataset",
-                    color="Events",
-                    color_continuous_scale="Blues",
-                )
-                fig_ds.update_layout(xaxis_tickangle=-30)
-                st.plotly_chart(fig_ds, use_container_width=True)
-
-        # Events by category
-        cat_buckets_all = (dataset_agg.get("by_category") or {}).get("buckets", [])
-        with col_cat:
-            if cat_buckets_all:
-                ac_df = pd.DataFrame(cat_buckets_all).rename(
-                    columns={"key": "Category", "doc_count": "Events"}
-                ).sort_values("Events", ascending=False).head(15)
-                fig_ac = px.bar(
-                    ac_df, x="Events", y="Category",
-                    orientation="h",
-                    title="Top 15 Event Categories",
-                    color="Events",
-                    color_continuous_scale="Greens",
-                )
-                st.plotly_chart(fig_ac, use_container_width=True)
-
-        # Enrichment progress
-        st.divider()
-        prog_col1, prog_col2, prog_col3 = st.columns(3)
-        prog_col1.metric("Total indexed events", f"{total_events:,}")
-        prog_col2.metric("Flagged anomalies",    f"{total_anomalies:,}")
-        prog_col3.metric(
-            "LLM-enriched",
-            f"{enriched_count:,}",
-            f"{total_anomalies - enriched_count:,} remaining",
-        )
-
-        if total_anomalies > 0:
-            pct = enriched_count / total_anomalies
-            st.progress(pct, text=f"Enrichment progress: {pct*100:.1f}%")
+    fig = px.bar(
+        stub, x="Tactic", y=["Covered", "Gap"],
+        title="ATT&CK Coverage by Tactic (stub — replace with CALDERA data)",
+        labels={"value": "Techniques", "variable": ""},
+        color_discrete_map={"Covered": "#2ecc71", "Gap": "#e74c3c"},
+        barmode="stack",
+    )
+    fig.update_layout(xaxis_tickangle=-20)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Data is placeholder. Phase 8 will populate this from CALDERA operation results.")

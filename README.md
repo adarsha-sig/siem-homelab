@@ -67,7 +67,7 @@ make ingest
 
 # 5. Train the Isolation Forest and score all events (~3 min)
 make train
-# or: docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py
+# or: docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if
 
 # 6. Open the dashboard
 open http://localhost:8501
@@ -95,13 +95,13 @@ and `--verbose`.
 docker exec soc_jupyter python3 /home/jovyan/work/src/ingest/load_mordor.py
 
 # Full retrain: fetch all events, fit IF, score, save model
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if
 
 # Incremental scoring: load saved model, score only new events
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py \
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if \
   --score-only
 # or with an explicit cutoff:
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py \
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if \
   --score-only --since 2020-09-21T00:00:00Z
 
 # LLM enrichment: add ATT&CK mapping + investigation steps to top anomalies
@@ -139,7 +139,7 @@ make test-all     All tests including integration
 
 | File | Description |
 |------|-------------|
-| `data/models/isolation_forest.pkl` | Fitted IF + StandardScaler bundle |
+| `data/models/isolation_forest.pkl` | Fitted IF + StandardScaler bundle (written by `model_runner.py --model if`) |
 | `data/runs/retrain_*.json` | JSON audit trail — one file per scheduler run |
 
 ## Anomaly features (13 total)
@@ -207,12 +207,12 @@ most recent non-dry-run audit file in `data/runs/`:
 ```bash
 make score-only
 # equivalent:
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py \
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if \
   --score-only
 ```
 
 For historical datasets like Mordor, pass `--since` explicitly:
 ```bash
-docker exec soc_jupyter python3 /home/jovyan/work/src/models/isolation_forest.py \
+docker exec soc_jupyter python3 /home/jovyan/work/src/models/model_runner.py --model if \
   --score-only --since 2020-09-21T00:00:00Z
 ```
