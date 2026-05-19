@@ -9,7 +9,11 @@ containers: Elasticsearch (data), Jupyter (ML), Ollama (LLM), Streamlit (UI).
 - Python 3.11
 - Elasticsearch 8.14 (no auth, local only)
 - Docker Compose v2
-- Ollama with llama3.1:8b
+- Ollama with llama3.2:3b (default)
+  # Model tradeoff: llama3.2:3b — ~2 GB RAM, ~2 s/response, good for real-time
+  # triage of high-volume alert queues. llama3.1:8b — ~5 GB RAM, ~8 s/response,
+  # higher reasoning quality and more accurate ATT&CK technique mapping; prefer it
+  # for the weekly enrichment sweep where latency is not critical.
 - Key Python libs: elasticsearch==8.14, scikit-learn, pyod, torch, streamlit
 
 ## Project layout

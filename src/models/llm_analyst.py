@@ -1,6 +1,10 @@
 """
 Sends top anomalies to a local Ollama LLM and returns a plain-English triage summary.
-Requires Ollama running with a model pulled: `ollama pull llama3.1:8b`
+Requires Ollama running with a model pulled: `ollama pull llama3.2:3b`
+
+NOTE: this is Phase 1 scaffolding. It will be superseded by
+src/enrichment/alert_explainer.py in Phase 4, which targets the correct
+security-scores-if index and returns structured JSON for ES write-back.
 """
 
 from __future__ import annotations
@@ -15,7 +19,11 @@ from loguru import logger
 ES_HOST = os.getenv("ELASTIC_URL", "http://localhost:9200")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 INDEX = "siem-logs"
-OLLAMA_MODEL = "llama3.1:8b"
+
+# llama3.2:3b — ~2 GB RAM, ~2 s/response. Fast enough for real-time triage
+# in the dashboard. Use llama3.1:8b for the weekly enrichment sweep where
+# latency is acceptable and ATT&CK mapping accuracy matters more.
+OLLAMA_MODEL = "llama3.2:3b"
 SCORE_THRESHOLD = 0.75
 MAX_EVENTS = 10
 

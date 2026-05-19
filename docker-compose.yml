@@ -25,7 +25,9 @@ services:
       - soc_net
 
   # ── Ollama (local LLM) ───────────────────────────────────────────────────────
-  # Pull the model once after first start:
+  # Pull the default model once after first start:
+  #   docker exec soc_ollama ollama pull llama3.2:3b
+  # For higher ATT&CK mapping accuracy (more RAM, slower):
   #   docker exec soc_ollama ollama pull llama3.1:8b
   ollama:
     image: ollama/ollama:latest

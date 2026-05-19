@@ -21,7 +21,7 @@ LLM triage → surfaces everything in a Streamlit dashboard.
 4. Graph analytics for lateral movement (auth event graph)
 
 ## LLM enrichment
-- Model: llama3.1:8b via Ollama REST API
+- Model: llama3.2:3b via Ollama REST API (default; swap to llama3.1:8b for higher ATT&CK mapping accuracy)
 - For each anomaly: produce ATT&CK mapping, plain-english explanation,
   FP assessment (high/medium/low confidence true positive), 3 investigation steps
 - Write enrichment back to ml.llm_triage field in the scores index
