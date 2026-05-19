@@ -1,0 +1,94 @@
+services:
+
+  # ── Elasticsearch ────────────────────────────────────────────────────────────
+  # Single-node, no auth (local VM only). ES_JAVA_OPTS cap prevents OOM on a
+  # memory-constrained home-lab machine; raise -Xmx if you have the headroom.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: soc_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx1g
+      - ELASTIC_URL=http://localhost:9200
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks:
+      - soc_net
+
+  # ── Ollama (local LLM) ───────────────────────────────────────────────────────
+  # Pull the model once after first start:
+  #   docker exec soc_ollama ollama pull llama3.1:8b
+  ollama:
+    image: ollama/ollama:latest
+    container_name: soc_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - soc_net
+
+  # ── Jupyter Lab ──────────────────────────────────────────────────────────────
+  # Built from our custom Dockerfile so the ML stack is baked in at image-build
+  # time rather than installed on every container start.
+  jupyter:
+    build:
+      context: ./docker/jupyter
+      dockerfile: Dockerfile
+    container_name: soc_jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+      - ELASTIC_URL=http://elasticsearch:9200
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./data:/home/jovyan/work/data
+      - ./src:/home/jovyan/work/src
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - soc_net
+
+  # ── Streamlit dashboard ───────────────────────────────────────────────────────
+  # Also built from a custom Dockerfile (slim image, only dashboard deps).
+  # src/ bind-mount means code changes on the host are reflected immediately
+  # (Streamlit's file watcher picks them up without a restart).
+  streamlit:
+    build:
+      context: ./docker/streamlit
+      dockerfile: Dockerfile
+    container_name: soc_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - ELASTIC_URL=http://elasticsearch:9200
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - soc_net
+
+volumes:
+  es_data:
+  ollama_models:
+
+networks:
+  soc_net:
+    driver: bridge

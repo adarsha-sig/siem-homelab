@@ -1,0 +1,58 @@
+# ── Raw datasets (large binaries, re-downloadable from OTRF) ─────────────────
+data/raw/*
+!data/raw/.gitkeep
+
+# ── Processed artifacts and saved models ─────────────────────────────────────
+data/processed/*
+!data/processed/.gitkeep
+
+data/models/*
+!data/models/.gitkeep
+
+# ── Scheduler run logs ────────────────────────────────────────────────────────
+data/runs/*
+!data/runs/.gitkeep
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Docker volumes (if ever bind-mounted locally) ────────────────────────────
+es-data/
+ollama-models/
+
+# ── Claude Code local settings (machine-specific permission allowlists) ───────
+.claude/
+
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets/

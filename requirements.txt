@@ -1,0 +1,38 @@
+# --- Elasticsearch ---
+elasticsearch==8.13.0
+
+# --- Data & ML ---
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.4.2
+scipy==1.13.0
+joblib==1.4.2
+
+# --- Anomaly detection ---
+pyod==1.1.3          # outlier detection algorithms (IsolationForest, LOF, OCSVM, etc.)
+river==0.21.2        # online/streaming ML for real-time anomaly scoring
+
+# --- LLM / Ollama ---
+ollama==0.2.1        # official Ollama Python client
+langchain==0.2.3
+langchain-community==0.2.3
+
+# --- NLP / log parsing ---
+sentence-transformers==3.0.1
+transformers==4.41.2
+torch==2.3.1
+
+# --- Scheduling ---
+apscheduler==3.10.4
+
+# --- Dashboard ---
+streamlit==1.35.0
+plotly==5.22.0
+altair==5.3.0
+
+# --- Utilities ---
+python-dotenv==1.0.1
+pydantic==2.7.2
+httpx==0.27.0
+tqdm==4.66.4
+loguru==0.7.2

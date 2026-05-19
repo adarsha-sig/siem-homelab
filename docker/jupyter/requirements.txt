@@ -1,0 +1,22 @@
+# Elasticsearch client — must match the server major version
+elasticsearch==8.14.0
+
+# Core data science
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.0
+matplotlib==3.9.0
+seaborn==0.13.2
+tqdm==4.66.4
+
+# Graph analytics (Phase 4 — lateral movement)
+networkx==3.3
+
+# ML — anomaly detection
+scikit-learn==1.4.2
+pyod==1.1.3
+
+# Deep learning (LSTM model, Phase 3)
+# CPU-only torch keeps the image size manageable on a home-lab VM.
+# Swap for the CUDA variant if you have a GPU.
+torch==2.3.1
