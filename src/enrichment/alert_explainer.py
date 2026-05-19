@@ -2,29 +2,33 @@
 LLM-based alert enrichment for anomalies scored by the Isolation Forest.
 
 Security intuition: anomaly scores tell you *that* an event is unusual but not
-*why* it matters. A score of 0.95 on a process_creation event is meaningless to
-a tier-1 analyst without context — is it a false positive from a patching tool or
-a real PsExec lateral movement? This script sends each flagged alert to a local
-LLM (no data leaves the machine) and asks it to produce: an ATT&CK technique
-mapping, a plain-English description, a false-positive assessment, and three
-concrete investigation steps. That output is written back to the scores index as
-ml.llm_triage so the dashboard can surface it alongside the alert.
+*why* it matters. This script sends each flagged alert to an LLM and asks it to
+produce: an ATT&CK technique mapping, a plain-English description, a false-positive
+assessment, and three concrete investigation steps. It then combines the IF score,
+the percentile rank, and the LLM's TP confidence into a single combined_confidence
+score and writes everything back to the scores index.
+
+LLM backends (LLM_BACKEND env var, default "groq"):
+  groq   — Groq cloud API (llama-3.1-8b-instant); requires GROQ_API_KEY
+  claude — Anthropic API (claude-haiku-4-5-20251001); requires ANTHROPIC_API_KEY
+  ollama — local Ollama (llama3.2:3b); requires OLLAMA_URL and a pulled model
 
 Design decisions:
-- Processes only documents where ml.is_anomaly=true AND ml.llm_triage is absent,
-  making runs safely idempotent and supporting incremental enrichment.
-- Uses a Painless script update (not a doc-level replace) so ml.anomaly_score,
-  ml.is_anomaly, ml.model, and ml.scored_at are never touched.
-- Prompts for strict JSON output and validates the schema; falls back gracefully
-  if the model returns prose instead of JSON.
-- Uses ollama.Client(host=...) to respect the OLLAMA_URL env var — the default
-  ollama.chat() ignores custom host settings.
+- Processes only documents where ml.is_anomaly=true AND ml.enriched is absent/false,
+  making runs safely idempotent.
+- Painless script updates are used for all ES writes so ml.anomaly_score and
+  ml.is_anomaly are never touched.
+- Prompts include the statistical context (percentile, top features) so the LLM
+  understands the severity relative to the environment baseline.
+- compute_combined_confidence() fuses IF score, percentile, and LLM TP confidence
+  into a single scalar and detects IF↔LLM disagreements.
 
 Usage:
   python src/enrichment/alert_explainer.py               # enrich up to 50 anomalies
-  python src/enrichment/alert_explainer.py --dry-run     # preview without ES writes
-  python src/enrichment/alert_explainer.py --limit 10 --verbose
-  python src/enrichment/alert_explainer.py --model llama3.1:8b
+  python src/enrichment/alert_explainer.py --dry-run
+  python src/enrichment/alert_explainer.py --limit 20 --backend groq
+  python src/enrichment/alert_explainer.py --backend claude --verbose
+  python src/enrichment/alert_explainer.py --backend ollama --model llama3.1:8b
 """
 
 from __future__ import annotations
@@ -36,8 +40,8 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
-import ollama
 from elasticsearch import Elasticsearch
 
 logging.basicConfig(
@@ -51,12 +55,18 @@ ES_URL       = os.getenv("ELASTIC_URL", "http://localhost:9200")
 OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434")
 SCORES_INDEX = "security-scores-if"
 
-# llama3.2:3b — ~2 GB RAM, ~2 s/response; good for interactive triage.
-# llama3.1:8b — ~5 GB RAM, ~8 s/response; better ATT&CK technique accuracy.
-DEFAULT_MODEL = "llama3.2:3b"
-DEFAULT_LIMIT = 50
+# ── Backend configuration ─────────────────────────────────────────────────────
+# LLM_BACKEND selects the inference provider. Default is groq for fast cloud
+# inference without local GPU requirements. Ollama is the local fallback.
+LLM_BACKEND    = os.getenv("LLM_BACKEND", "groq")
+GROQ_MODEL     = "llama-3.1-8b-instant"
+CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
+OLLAMA_MODEL   = "llama3.2:3b"
+DEFAULT_MODEL  = OLLAMA_MODEL   # kept for backward-compat with existing callers
 
-# Required keys in the LLM JSON response; used for validation.
+DEFAULT_LIMIT  = 50
+
+# Required keys in the LLM JSON response.
 _REQUIRED_KEYS = {
     "attack_technique",
     "attack_tactic",
@@ -67,8 +77,23 @@ _REQUIRED_KEYS = {
 }
 _VALID_FP = {"low", "medium", "high"}
 
+# fp_assessment → llm_confidence (confidence that this is a TRUE POSITIVE).
+# Mapping direction: "low" FP probability = high TP confidence = 1.0.
+# "high" FP probability = low TP confidence = 0.2.
+# This is intentionally the inverse of the fp_assessment label to ensure
+# combined_confidence is high for events the LLM believes are real threats.
+_FP_TO_LLM_CONF: dict[str, float] = {
+    "low":    1.0,   # low FP probability → confident it's a TP
+    "medium": 0.6,
+    "high":   0.2,   # high FP probability → LLM doubts it's real
+}
+
 
 # ── Elasticsearch helpers ─────────────────────────────────────────────────────
+
+def client_from_env() -> Elasticsearch:
+    return Elasticsearch(ES_URL)
+
 
 def fetch_unenriched_anomalies(
     client: Elasticsearch,
@@ -77,13 +102,8 @@ def fetch_unenriched_anomalies(
     """
     Return the top-scoring anomalies that have not yet been LLM-enriched.
 
-    Security intuition: sorting by anomaly_score descending means we always
-    enrich the highest-confidence findings first. If the LLM quota or rate
-    limit cuts a run short, the most important alerts have already been triaged.
-    The must_not filter on ml.enriched makes runs idempotent. We use the
-    indexed boolean ml.enriched (not ml.llm_triage) because ml.llm_triage has
-    mapping enabled:false — ES stores it in _source but never indexes it, so
-    exists queries on it always return zero results.
+    Fetches anomaly_percentile and top_features alongside the event fields so
+    build_prompt() can include statistical context without a second ES round-trip.
     """
     resp = client.search(
         index=SCORES_INDEX,
@@ -97,17 +117,11 @@ def fetch_unenriched_anomalies(
             "sort": [{"ml.anomaly_score": "desc"}],
             "size": limit,
             "_source": [
-                "@timestamp",
-                "host.name",
-                "user.name",
-                "process.name",
-                "process.parent.name",
-                "process.command_line",
-                "event.category",
-                "event.channel",
-                "event.id",
+                "@timestamp", "host.name", "user.name",
+                "process.name", "process.parent.name", "process.command_line",
+                "event.category", "event.channel", "event.id",
                 "source_dataset",
-                "ml.anomaly_score",
+                "ml.anomaly_score", "ml.anomaly_percentile", "ml.top_features",
             ],
         },
     )
@@ -118,22 +132,13 @@ def fetch_unenriched_anomalies(
 
 def write_triage(client: Elasticsearch, doc_id: str, triage: dict) -> None:
     """
-    Patch ml.llm_triage onto an existing document using a Painless script.
-
-    Security intuition for the design: a doc-level update ({"doc": {"ml": {...}}})
-    would replace the entire ml object, silently zeroing out anomaly_score and
-    is_anomaly. The Painless script surgically sets only the llm_triage sub-field,
-    leaving all other ml.* fields untouched. Safe to call multiple times — it
-    overwrites llm_triage if it already exists.
+    Patch ml.llm_triage and ml.enriched onto an existing document via Painless.
+    Does NOT touch ml.anomaly_score, ml.is_anomaly, or any other ml.* field.
     """
     client.update(
         index=SCORES_INDEX,
         id=doc_id,
         script={
-            # Set both the triage payload and the indexed flag atomically.
-            # ml.llm_triage has enabled:false so ES won't index it, but
-            # ml.enriched is a normal boolean and IS indexed — use it for
-            # exists/term queries and the idempotency filter.
             "source": (
                 "ctx._source.ml.llm_triage = params.triage; "
                 "ctx._source.ml.enriched = true"
@@ -144,31 +149,133 @@ def write_triage(client: Elasticsearch, doc_id: str, triage: dict) -> None:
     )
 
 
+def write_combined_confidence(
+    client: Elasticsearch, doc_id: str, fields: dict,
+) -> None:
+    """
+    Write combined_confidence, llm_confidence, if_llm_disagreement, and
+    routing_decision back to the document via a single Painless script.
+
+    A separate script from write_triage so these fields can be recomputed
+    independently of the triage text (e.g. when thresholds change).
+    """
+    client.update(
+        index=SCORES_INDEX,
+        id=doc_id,
+        script={
+            "source": (
+                "ctx._source.ml.combined_confidence = params.combined; "
+                "ctx._source.ml.llm_confidence = params.llm_conf; "
+                "ctx._source.ml.if_llm_disagreement = params.disagreement; "
+                "ctx._source.ml.routing_decision = params.routing;"
+            ),
+            "lang":   "painless",
+            "params": {
+                "combined":    fields["combined_confidence"],
+                "llm_conf":    fields["llm_confidence"],
+                "disagreement": fields["if_llm_disagreement"],
+                "routing":     fields["routing_decision"],
+            },
+        },
+    )
+
+
+# ── Combined confidence ───────────────────────────────────────────────────────
+
+def compute_combined_confidence(
+    if_score: float,
+    percentile: Optional[float],
+    fp_assessment: str,
+) -> dict:
+    """
+    Fuse the IF anomaly score, percentile rank, and LLM TP confidence into a
+    single combined_confidence score, then derive routing and disagreement flag.
+
+    Formula: combined = (if_score × pct_norm × llm_conf)^(1/3)
+
+    Geometric mean keeps the score in [0,1] and ensures all three signals must
+    be present for a high combined score — one weak signal drags it down. This
+    prevents a very high IF score from overriding a strong LLM FP assessment.
+
+    Security intuition: if_llm_disagreement fires when the IF model and the LLM
+    reach opposite conclusions. The IF scored the event very high (structural
+    rarity) but the LLM believes it is probably a false positive (contextual
+    reasoning). These cases deserve a human analyst eye — the model may have
+    learned a spurious pattern, or the LLM may be missing domain context.
+    """
+    llm_conf = _FP_TO_LLM_CONF.get(fp_assessment.strip().lower(), 0.5)
+
+    # Normalise percentile to [0,1]; fall back to the IF score itself when absent
+    # (events scored before model_runner.py added percentile computation).
+    pct_norm = (percentile / 100.0) if percentile is not None else float(if_score)
+
+    combined = float((float(if_score) * pct_norm * llm_conf) ** (1.0 / 3.0))
+
+    # Disagreement: IF says highly anomalous but LLM has low TP confidence.
+    disagreement = bool(float(if_score) > 0.8 and llm_conf < 0.3)
+
+    if combined >= 0.7:
+        routing = "tier-1"
+    elif combined >= 0.4:
+        routing = "tier-2"
+    else:
+        routing = "auto-close"
+
+    return {
+        "combined_confidence": round(combined, 4),
+        "llm_confidence":      round(llm_conf, 2),
+        "if_llm_disagreement": disagreement,
+        "routing_decision":    routing,
+    }
+
+
 # ── Prompt engineering ────────────────────────────────────────────────────────
+
+def _format_top_features(top_features: Optional[list]) -> str:
+    """Render top_features list as a readable string for the prompt."""
+    if not top_features:
+        return "(not available — event was scored before feature attribution was added)"
+    parts = []
+    for feat in top_features[:3]:
+        z = feat.get("z_score", 0)
+        direction = "above" if z > 0 else "below"
+        parts.append(f"{feat['feature']} (z={z:+.2f}, {direction} baseline)")
+    return "; ".join(parts)
+
 
 def build_prompt(src: dict) -> str:
     """
-    Build the LLM prompt for a single alert.
+    Build the LLM prompt for a single alert, including statistical context.
 
-    Security intuition: smaller models (3b parameters) need more explicit
-    output-format guidance than larger ones. Including one concrete JSON example
-    in the prompt dramatically improves schema compliance for llama3.2:3b.
-    We deliberately exclude fields the LLM can't usefully interpret (raw binary
-    data, internal ES IDs) to keep the context tight and within the model's
-    effective attention window.
+    Security intuition: providing the percentile rank and top contributing
+    features gives the LLM the same statistical context a data scientist would
+    have. Without it, a model cannot distinguish between a score of 0.95 that
+    is the 99th percentile (very rare) vs one that is the 70th percentile
+    (moderately unusual). The phrase "statistically unusual for this specific
+    environment" grounds the assessment in the actual deployment baseline rather
+    than generic threat intelligence.
     """
-    proc    = (src.get("process") or {}).get("name") or "unknown"
-    parent  = ((src.get("process") or {}).get("parent") or {}).get("name") or "unknown"
-    cmd     = (src.get("process") or {}).get("command_line") or "(not recorded)"
-    user    = (src.get("user") or {}).get("name") or "unknown"
-    host    = (src.get("host") or {}).get("name") or "unknown"
-    cat     = (src.get("event") or {}).get("category") or "unknown"
-    channel = (src.get("event") or {}).get("channel") or "unknown"
-    score   = (src.get("ml") or {}).get("anomaly_score", 0)
-    dataset = src.get("source_dataset") or "unknown"
+    proc        = (src.get("process") or {}).get("name") or "unknown"
+    parent      = ((src.get("process") or {}).get("parent") or {}).get("name") or "unknown"
+    cmd         = (src.get("process") or {}).get("command_line") or "(not recorded)"
+    user        = (src.get("user") or {}).get("name") or "unknown"
+    host        = (src.get("host") or {}).get("name") or "unknown"
+    cat         = (src.get("event") or {}).get("category") or "unknown"
+    channel     = (src.get("event") or {}).get("channel") or "unknown"
+    ml          = src.get("ml") or {}
+    score       = ml.get("anomaly_score", 0)
+    percentile  = ml.get("anomaly_percentile")
+    top_feats   = ml.get("top_features")
+    dataset     = src.get("source_dataset") or "unknown"
+
+    pct_str = (
+        f"{percentile:.1f}th percentile" if percentile is not None
+        else "percentile unavailable"
+    )
+    feat_str = _format_top_features(top_feats)
 
     event_summary = (
-        f"anomaly_score: {score:.4f}\n"
+        f"anomaly_score: {score:.4f}  ({pct_str})\n"
         f"event.category: {cat}\n"
         f"event.channel: {channel}\n"
         f"process.name: {proc}\n"
@@ -176,10 +283,11 @@ def build_prompt(src: dict) -> str:
         f"process.command_line: {cmd}\n"
         f"user.name: {user}\n"
         f"host.name: {host}\n"
-        f"source_dataset: {dataset}"
+        f"source_dataset: {dataset}\n"
+        f"top_contributing_features: {feat_str}"
     )
 
-    return f"""You are a senior SOC analyst and MITRE ATT&CK expert. Analyse the following Windows security event that was flagged as anomalous by a machine learning model. Respond ONLY with a valid JSON object — no markdown, no explanation outside the JSON.
+    return f"""You are a senior SOC analyst and MITRE ATT&CK expert. Analyse the following Windows security event. Note that this event is statistically unusual for this specific environment — it scored at the {pct_str}, meaning it is more anomalous than the vast majority of events observed in this deployment. Your analysis must account for this statistical context. Respond ONLY with a valid JSON object.
 
 Event:
 {event_summary}
@@ -188,9 +296,9 @@ Required JSON schema (respond with exactly these keys):
 {{
   "attack_technique": "TXXXX or TXXXX.XXX (single best match)",
   "attack_tactic":    "ATT&CK tactic name (e.g. Lateral Movement)",
-  "description":      "One sentence plain-English summary of what happened and why it is suspicious",
-  "fp_assessment":    "low | medium | high  (confidence this is a TRUE POSITIVE — low FP means high confidence)",
-  "fp_reasoning":     "One sentence explaining the FP assessment",
+  "description":      "One sentence plain-English summary referencing the percentile rank to convey severity",
+  "fp_assessment":    "low | medium | high  (low = very likely a true positive; high = likely a false positive)",
+  "fp_reasoning":     "One sentence explaining the FP assessment, referencing the top features if relevant",
   "investigation_steps": [
     "Step 1: concrete action an analyst should take",
     "Step 2: ...",
@@ -202,9 +310,9 @@ Example of a correctly formatted response:
 {{
   "attack_technique": "T1059.001",
   "attack_tactic": "Execution",
-  "description": "PowerShell was launched with an encoded command, a common obfuscation technique used to hide malicious payload downloads.",
+  "description": "PowerShell was launched with an encoded command at the 99th percentile of anomaly, strongly suggesting malicious obfuscation rather than legitimate administrative use.",
   "fp_assessment": "low",
-  "fp_reasoning": "Encoded PowerShell commands have very few legitimate uses in enterprise environments.",
+  "fp_reasoning": "cmd_has_encoding and proc_rarity are both multiple standard deviations above baseline — encoded PowerShell spawned from a rare parent process is nearly always malicious.",
   "investigation_steps": [
     "Decode the base64 command and review the plaintext payload for IOCs",
     "Check for outbound network connections from the same host within 60 seconds",
@@ -220,38 +328,59 @@ Respond now with JSON only:"""
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def call_llm(prompt: str, model: str, client: ollama.Client) -> str:
+def call_llm(prompt: str, backend: str, model: str) -> str:
     """
-    Send a prompt to Ollama and return the raw response text.
+    Dispatch the prompt to the requested LLM backend and return the raw text.
 
-    Security intuition: temperature=0 makes the model deterministic so that
-    re-running the enrichment on the same alert produces a stable ATT&CK
-    mapping. Stochastic outputs would make the triage unreliable for audit
-    trail purposes.
+    temperature=0 is applied on all backends for deterministic output so that
+    re-running enrichment on the same alert produces a stable ATT&CK mapping.
+
+    Security intuition: deterministic output is important for audit trails —
+    the triage written to ES must not change on every re-run, otherwise analysts
+    cannot rely on previously enriched alerts staying consistent.
     """
-    response = client.chat(
+    if backend == "groq":
+        from groq import Groq
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=1024,
+        )
+        return resp.choices[0].message.content
+
+    if backend == "claude":
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+    # Default: ollama (local, no API key required)
+    import ollama as _ollama
+    oc = _ollama.Client(host=OLLAMA_URL)
+    resp = oc.chat(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0},
     )
-    return response["message"]["content"]
+    return resp["message"]["content"]
 
 
-def parse_response(raw: str) -> dict | None:
+def parse_response(raw: str) -> Optional[dict]:
     """
     Extract and validate the JSON triage object from the LLM response.
-
-    The model sometimes wraps JSON in markdown code fences or adds a leading
-    explanation sentence. The regex extracts the first {...} block so minor
-    formatting variations don't cause hard failures.
+    Handles markdown code fences and leading prose gracefully.
     """
-    # Strip markdown code fences if present.
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
-    # Extract the first JSON object from the response.
     match = _JSON_RE.search(text)
     if not match:
         log.warning("LLM returned no JSON object in response")
@@ -263,23 +392,20 @@ def parse_response(raw: str) -> dict | None:
         log.warning("JSON parse failed: %s", exc)
         return None
 
-    # Validate required keys.
     missing = _REQUIRED_KEYS - set(obj.keys())
     if missing:
         log.warning("LLM response missing keys: %s", missing)
         return None
 
-    # Normalise fp_assessment to expected values.
     obj["fp_assessment"] = obj["fp_assessment"].strip().lower()
     if obj["fp_assessment"] not in _VALID_FP:
         obj["fp_assessment"] = "medium"
 
-    # Ensure investigation_steps is a list of strings.
     steps = obj.get("investigation_steps", [])
     if not isinstance(steps, list) or len(steps) < 1:
         log.warning("investigation_steps is missing or not a list")
         return None
-    obj["investigation_steps"] = [str(s) for s in steps[:5]]  # cap at 5
+    obj["investigation_steps"] = [str(s) for s in steps[:5]]
 
     return obj
 
@@ -288,34 +414,41 @@ def parse_response(raw: str) -> dict | None:
 
 def enrich_one(
     hit: dict,
-    ollama_client: ollama.Client,
+    backend: str,
     model: str,
     dry_run: bool,
     verbose: bool,
-) -> dict | None:
+) -> Optional[dict]:
     """
-    Enrich a single alert: build prompt → call LLM → parse → write to ES.
+    Enrich a single alert: build prompt → call LLM → parse → compute confidence
+    → write triage and confidence fields to ES.
 
-    Returns the parsed triage dict on success, None on failure. Failures are
-    logged but not raised so a single bad LLM response doesn't abort the batch.
+    Returns a dict with triage + confidence on success, None on failure.
+    Failures are logged but not re-raised so one bad response doesn't abort
+    the batch.
     """
     doc_id = hit["_id"]
     src    = hit["_source"]
-    score  = (src.get("ml") or {}).get("anomaly_score", 0)
+    ml     = src.get("ml") or {}
+    score  = ml.get("anomaly_score", 0)
+    pct    = ml.get("anomaly_percentile")
     proc   = (src.get("process") or {}).get("name") or "(none)"
 
     log.info(
-        "Enriching %s — score=%.4f  proc=%s  category=%s",
-        doc_id[:8], score, proc,
+        "Enriching %s — score=%.4f  pct=%s  proc=%s  category=%s  backend=%s",
+        doc_id[:8], score,
+        f"{pct:.1f}" if pct is not None else "?",
+        proc,
         (src.get("event") or {}).get("category", "?"),
+        backend,
     )
 
     prompt = build_prompt(src)
 
     try:
-        raw = call_llm(prompt, model, ollama_client)
+        raw = call_llm(prompt, backend, model)
     except Exception as exc:
-        log.error("Ollama call failed for %s: %s", doc_id[:8], exc)
+        log.error("%s call failed for %s: %s", backend, doc_id[:8], exc)
         return None
 
     if verbose:
@@ -326,67 +459,97 @@ def enrich_one(
         log.warning("Skipping %s — could not parse LLM response", doc_id[:8])
         return None
 
+    confidence = compute_combined_confidence(score, pct, triage["fp_assessment"])
+
     if dry_run:
-        print(f"\n  [{doc_id[:8]}] score={score:.4f}  proc={proc}")
+        pct_str = f"{pct:.1f}" if pct is not None else "?"
+        print(f"\n  [{doc_id[:8]}] score={score:.4f}  pct={pct_str}  proc={proc}")
         print(f"    technique : {triage['attack_technique']}  ({triage['attack_tactic']})")
         print(f"    fp        : {triage['fp_assessment']} — {triage['fp_reasoning']}")
         print(f"    summary   : {triage['description']}")
+        print(
+            f"    combined  : {confidence['combined_confidence']:.4f}"
+            f"  llm_conf={confidence['llm_confidence']}"
+            f"  routing={confidence['routing_decision']}"
+            f"  disagreement={confidence['if_llm_disagreement']}"
+        )
         for i, step in enumerate(triage["investigation_steps"], 1):
             print(f"    step {i}    : {step}")
     else:
+        es = client_from_env()
         try:
-            write_triage(client_from_env(), doc_id, triage)
+            write_triage(es, doc_id, triage)
+            write_combined_confidence(es, doc_id, confidence)
         except Exception as exc:
             log.error("ES write failed for %s: %s", doc_id[:8], exc)
             return None
 
-    return triage
+    return {**triage, **confidence}
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
-
-def client_from_env() -> Elasticsearch:
-    """Return an ES client using ELASTIC_URL from the environment."""
-    return Elasticsearch(ES_URL)
-
 
 def run(
     dry_run: bool = False,
     verbose: bool = False,
     limit: int = DEFAULT_LIMIT,
-    model: str = DEFAULT_MODEL,
+    model: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> dict:
     """
-    Enrich up to `limit` unenriched anomalies. Returns a summary dict.
+    Enrich up to `limit` unenriched anomalies. Importable by the scheduler.
 
-    Importable by the scheduler for the weekly enrichment sweep.
+    backend defaults to LLM_BACKEND env var (default: "groq").
+    model defaults to the backend's canonical model when not specified.
     """
-    es     = client_from_env()
-    ollama_client = ollama.Client(host=OLLAMA_URL)
+    _backend = backend or LLM_BACKEND
+    _model   = model or {
+        "groq":   GROQ_MODEL,
+        "claude": CLAUDE_MODEL,
+        "ollama": OLLAMA_MODEL,
+    }.get(_backend, OLLAMA_MODEL)
 
+    log.info("Starting enrichment: backend=%s model=%s limit=%d dry_run=%s",
+             _backend, _model, limit, dry_run)
+
+    es   = client_from_env()
     hits = fetch_unenriched_anomalies(es, limit=limit)
     if not hits:
         log.info("No unenriched anomalies found — nothing to do.")
-        return {"processed": 0, "succeeded": 0, "failed": 0, "dry_run": dry_run}
+        return {"processed": 0, "succeeded": 0, "failed": 0,
+                "dry_run": dry_run, "backend": _backend, "model": _model}
 
     succeeded, failed = 0, 0
+    disagreements = []
+
     for hit in hits:
-        result = enrich_one(hit, ollama_client, model, dry_run=dry_run, verbose=verbose)
+        result = enrich_one(hit, _backend, _model, dry_run=dry_run, verbose=verbose)
         if result is not None:
             succeeded += 1
+            if result.get("if_llm_disagreement"):
+                disagreements.append({
+                    "doc_id":   hit["_id"][:8],
+                    "score":    (hit["_source"].get("ml") or {}).get("anomaly_score"),
+                    "proc":     (hit["_source"].get("process") or {}).get("name"),
+                    "combined": result.get("combined_confidence"),
+                    "technique": result.get("attack_technique"),
+                    "fp":       result.get("fp_assessment"),
+                })
         else:
             failed += 1
 
-    log.info(
-        "Enrichment complete: %d succeeded, %d failed (dry_run=%s)",
-        succeeded, failed, dry_run,
-    )
+    log.info("Enrichment complete: %d succeeded, %d failed, %d disagreements",
+             succeeded, failed, len(disagreements))
+
     return {
-        "processed": len(hits),
-        "succeeded": succeeded,
-        "failed":    failed,
-        "dry_run":   dry_run,
-        "model":     model,
+        "processed":    len(hits),
+        "succeeded":    succeeded,
+        "failed":       failed,
+        "disagreements": len(disagreements),
+        "disagreement_details": disagreements,
+        "dry_run":      dry_run,
+        "backend":      _backend,
+        "model":        _model,
     }
 
 
@@ -394,24 +557,20 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Enrich anomalies in security-scores-if with LLM triage via Ollama."
+        description="Enrich anomalies in security-scores-if with LLM triage."
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print triage results to stdout without writing to Elasticsearch.",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Print the raw LLM response for each alert.",
-    )
-    parser.add_argument(
-        "--limit", type=int, default=DEFAULT_LIMIT, metavar="N",
-        help=f"Maximum number of alerts to enrich per run (default: {DEFAULT_LIMIT}).",
-    )
-    parser.add_argument(
-        "--model", default=DEFAULT_MODEL, metavar="NAME",
-        help=f"Ollama model to use (default: {DEFAULT_MODEL}).",
-    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print results without writing to Elasticsearch.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print the raw LLM response for each alert.")
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, metavar="N",
+                        help=f"Max alerts to enrich per run (default: {DEFAULT_LIMIT}).")
+    parser.add_argument("--backend", default=None, metavar="BACKEND",
+                        choices=["groq", "claude", "ollama"],
+                        help="LLM backend: groq (default), claude, ollama. "
+                             "Overrides LLM_BACKEND env var.")
+    parser.add_argument("--model", default=None, metavar="NAME",
+                        help="Override the backend's default model name.")
     args = parser.parse_args()
 
     summary = run(
@@ -419,10 +578,17 @@ def main() -> None:
         verbose=args.verbose,
         limit=args.limit,
         model=args.model,
+        backend=args.backend,
     )
     print("\nSummary:")
     for k, v in summary.items():
-        print(f"  {k}: {v}")
+        if k != "disagreement_details":
+            print(f"  {k}: {v}")
+    if summary.get("disagreement_details"):
+        print("\nDisagreement cases (IF anomalous, LLM says FP):")
+        for d in summary["disagreement_details"]:
+            print(f"  [{d['doc_id']}] score={d['score']:.4f}  proc={d['proc']}"
+                  f"  combined={d['combined']:.4f}  technique={d['technique']}  fp={d['fp']}")
     sys.exit(0)
 
 

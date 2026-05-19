@@ -90,17 +90,21 @@ SCORES_MAPPING = {
             "source_dataset": {"type": "keyword"},
             "ml": {
                 "properties": {
-                    "anomaly_score":      {"type": "float"},
-                    "anomaly_percentile": {"type": "float"},
-                    "is_anomaly":         {"type": "boolean"},
-                    "routing_decision":   {"type": "keyword"},
-                    "model":              {"type": "keyword"},
-                    "scored_at":          {"type": "date"},
-                    "enriched":           {"type": "boolean"},
+                    "anomaly_score":       {"type": "float"},
+                    "anomaly_percentile":  {"type": "float"},
+                    "is_anomaly":          {"type": "boolean"},
+                    "routing_decision":    {"type": "keyword"},
+                    "model":               {"type": "keyword"},
+                    "scored_at":           {"type": "date"},
+                    "enriched":            {"type": "boolean"},
+                    # Combined enrichment fields (written by alert_explainer.py)
+                    "combined_confidence": {"type": "float"},
+                    "llm_confidence":      {"type": "float"},
+                    "if_llm_disagreement": {"type": "boolean"},
                     # stored but not indexed — use ml.enriched for queries
-                    "llm_triage":         {"type": "object", "enabled": False},
+                    "llm_triage":          {"type": "object", "enabled": False},
                     # stored but not indexed — top feature list per event
-                    "top_features":       {"type": "object", "enabled": False},
+                    "top_features":        {"type": "object", "enabled": False},
                 }
             },
         }

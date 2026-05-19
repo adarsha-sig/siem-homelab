@@ -68,6 +68,8 @@ def load_alert_queue(threshold: float, limit: int) -> tuple[list[dict], pd.DataF
                     "ml.anomaly_score", "ml.anomaly_percentile",
                     "ml.is_anomaly", "ml.routing_decision",
                     "ml.enriched", "ml.llm_triage", "ml.top_features",
+                    "ml.combined_confidence", "ml.llm_confidence",
+                    "ml.if_llm_disagreement",
                 ],
             },
         )
@@ -90,7 +92,9 @@ def load_alert_queue(threshold: float, limit: int) -> tuple[list[dict], pd.DataF
             "_id":              h["_id"],
             "score":            round(ml.get("anomaly_score", 0), 4),
             "percentile":       ml.get("anomaly_percentile"),
+            "combined":         ml.get("combined_confidence"),
             "routing":          ml.get("routing_decision", "—"),
+            "disagreement":     ml.get("if_llm_disagreement", False),
             "enriched":         ml.get("enriched", False),
             "category":         ev.get("category", ""),
             "process":          pr.get("name", ""),
@@ -190,13 +194,45 @@ with tab_queue:
     if alert_df.empty:
         st.info(f"No events with score ≥ {threshold:.2f}. Lower the threshold or refresh.")
     else:
+        # ── Disagreement expander (analyst priority queue) ─────────────────────
+        disagree_df = alert_df[alert_df["disagreement"] == True]
+        if not disagree_df.empty:
+            with st.expander(
+                f"⚠️ Needs analyst review — {len(disagree_df)} IF↔LLM disagreement(s)",
+                expanded=True,
+            ):
+                st.caption(
+                    "**What is IF↔LLM disagreement?**  "
+                    "The Isolation Forest scored these events very highly (structural rarity > 0.8) "
+                    "but the LLM assessed them as likely false positives (fp_assessment = high). "
+                    "These are the cases where the model and the language model disagree most strongly. "
+                    "They require a human analyst to decide: is the IF detecting a genuine rare attack "
+                    "the LLM doesn't recognise, or did the IF learn a spurious pattern?",
+                    help=(
+                        "ml.if_llm_disagreement = True when ml.anomaly_score > 0.8 "
+                        "AND ml.llm_confidence < 0.3 (derived from fp_assessment = 'high'). "
+                        "These cases expose the fundamental tension between statistical rarity "
+                        "and contextual false-positive reasoning."
+                    ),
+                )
+                st.dataframe(
+                    disagree_df[["score", "percentile", "combined", "routing",
+                                 "category", "process", "dataset"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "score":    st.column_config.ProgressColumn("IF Score", min_value=0, max_value=1, format="%.4f"),
+                        "combined": st.column_config.NumberColumn("Combined", format="%.4f"),
+                    },
+                )
+
         st.caption(
             f"Showing top {len(alert_df):,} events with score ≥ {threshold:.2f} — "
             "click a row to see LLM triage"
         )
 
         display_df = alert_df[[
-            "score", "percentile", "routing", "enriched",
+            "score", "percentile", "combined", "routing", "disagreement", "enriched",
             "category", "process", "parent", "user", "host", "dataset",
         ]].copy()
 
@@ -207,15 +243,23 @@ with tab_queue:
             selection_mode="single-row",
             on_select="rerun",
             column_config={
-                "score":      st.column_config.ProgressColumn(
-                    "Score", min_value=0, max_value=1, format="%.4f", width="small",
+                "score":        st.column_config.ProgressColumn(
+                    "IF Score", min_value=0, max_value=1, format="%.4f", width="small",
                 ),
-                "percentile": st.column_config.NumberColumn(
+                "percentile":   st.column_config.NumberColumn(
                     "Pctile", format="%.1f", width="small",
                     help="Percentile rank within the scored batch (100 = most anomalous)",
                 ),
-                "routing":    st.column_config.TextColumn("Routing", width="small"),
-                "enriched":   st.column_config.CheckboxColumn("Triaged", width="small"),
+                "combined":     st.column_config.NumberColumn(
+                    "Combined", format="%.4f", width="small",
+                    help="Combined confidence: geometric mean of IF score, percentile, and LLM TP confidence. Higher = more suspicious.",
+                ),
+                "routing":      st.column_config.TextColumn("Routing", width="small"),
+                "disagreement": st.column_config.CheckboxColumn(
+                    "⚠️ Disagree", width="small",
+                    help="True when IF score > 0.8 but LLM has low TP confidence (fp_assessment=high). Requires human review.",
+                ),
+                "enriched":     st.column_config.CheckboxColumn("Triaged", width="small"),
                 "category":   st.column_config.TextColumn("Category"),
                 "process":    st.column_config.TextColumn("Process"),
                 "parent":     st.column_config.TextColumn("Parent"),

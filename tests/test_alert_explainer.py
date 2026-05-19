@@ -27,6 +27,7 @@ from src.enrichment.alert_explainer import (
     _REQUIRED_KEYS,
     _VALID_FP,
     build_prompt,
+    compute_combined_confidence,
     parse_response,
 )
 
@@ -42,6 +43,7 @@ def _make_src(
     category: str = "process_creation",
     channel: str = "Microsoft-Windows-Sysmon/Operational",
     score: float = 0.95,
+    percentile: float = 98.5,
     dataset: str = "empire_psexec_lateral",
 ) -> dict:
     return {
@@ -51,7 +53,16 @@ def _make_src(
         "process":       {"name": proc, "command_line": cmd, "parent": {"name": parent}},
         "event":         {"category": category, "channel": channel, "id": "1"},
         "source_dataset": dataset,
-        "ml":            {"anomaly_score": score, "is_anomaly": True},
+        "ml": {
+            "anomaly_score":      score,
+            "anomaly_percentile": percentile,
+            "is_anomaly":         True,
+            "top_features": [
+                {"feature": "proc_rarity",       "z_score": 3.45},
+                {"feature": "parent_child_rarity","z_score": 2.87},
+                {"feature": "cmd_has_encoding",  "z_score": 1.23},
+            ],
+        },
     }
 
 
@@ -132,6 +143,96 @@ class TestBuildPrompt:
         prompt = build_prompt({})
         assert isinstance(prompt, str)
         assert "unknown" in prompt
+
+    def test_contains_required_statistical_phrase(self):
+        prompt = build_prompt(_make_src())
+        assert "statistically unusual for this specific environment" in prompt
+
+    def test_contains_percentile(self):
+        prompt = build_prompt(_make_src(percentile=97.3))
+        assert "97.3" in prompt
+
+    def test_contains_top_features(self):
+        prompt = build_prompt(_make_src())
+        assert "proc_rarity" in prompt
+
+    def test_percentile_unavailable_renders_gracefully(self):
+        src = _make_src()
+        src["ml"].pop("anomaly_percentile", None)
+        prompt = build_prompt(src)
+        assert "percentile unavailable" in prompt
+
+    def test_no_top_features_renders_gracefully(self):
+        src = _make_src()
+        src["ml"].pop("top_features", None)
+        prompt = build_prompt(src)
+        assert "not available" in prompt
+
+
+# ── compute_combined_confidence tests ─────────────────────────────────────────
+
+class TestComputeCombinedConfidence:
+    def test_returns_all_required_keys(self):
+        result = compute_combined_confidence(0.9, 95.0, "low")
+        for key in ("combined_confidence", "llm_confidence",
+                    "if_llm_disagreement", "routing_decision"):
+            assert key in result
+
+    def test_high_score_low_fp_gives_high_combined(self):
+        result = compute_combined_confidence(0.95, 99.0, "low")
+        # low FP = llm_conf=1.0; high score; high percentile → high combined
+        assert result["combined_confidence"] > 0.7
+
+    def test_high_score_high_fp_gives_low_combined(self):
+        result = compute_combined_confidence(0.95, 99.0, "high")
+        # high FP = llm_conf=0.2 → pulls combined down
+        assert result["combined_confidence"] < 0.7
+
+    def test_fp_assessment_maps_to_llm_confidence_correctly(self):
+        # low FP → high TP confidence
+        assert compute_combined_confidence(0.8, 90.0, "low")["llm_confidence"]   == 1.0
+        assert compute_combined_confidence(0.8, 90.0, "medium")["llm_confidence"] == 0.6
+        assert compute_combined_confidence(0.8, 90.0, "high")["llm_confidence"]  == 0.2
+
+    def test_disagreement_fires_when_if_high_llm_low(self):
+        # if_score > 0.8 AND llm_conf < 0.3 (fp_assessment="high" → llm_conf=0.2)
+        result = compute_combined_confidence(0.9, 95.0, "high")
+        assert result["if_llm_disagreement"] is True
+
+    def test_no_disagreement_when_both_agree(self):
+        # IF high + LLM confident → no disagreement
+        result = compute_combined_confidence(0.9, 95.0, "low")
+        assert result["if_llm_disagreement"] is False
+
+    def test_no_disagreement_when_if_score_low(self):
+        # IF score below threshold even if LLM says FP
+        result = compute_combined_confidence(0.6, 60.0, "high")
+        assert result["if_llm_disagreement"] is False
+
+    def test_routing_tier1_when_combined_high(self):
+        result = compute_combined_confidence(0.95, 99.0, "low")
+        assert result["routing_decision"] == "tier-1"
+
+    def test_routing_auto_close_when_combined_low(self):
+        result = compute_combined_confidence(0.3, 30.0, "high")
+        assert result["routing_decision"] == "auto-close"
+
+    def test_combined_in_zero_one_range(self):
+        for if_s in [0.1, 0.5, 0.9]:
+            for pct in [10.0, 50.0, 99.0]:
+                for fp in ["low", "medium", "high"]:
+                    r = compute_combined_confidence(if_s, pct, fp)
+                    assert 0.0 <= r["combined_confidence"] <= 1.0
+
+    def test_none_percentile_falls_back_to_if_score(self):
+        r_none = compute_combined_confidence(0.8, None, "low")
+        r_same = compute_combined_confidence(0.8, 80.0, "low")
+        # pct_norm = if_score = 0.8, so results should match
+        assert abs(r_none["combined_confidence"] - r_same["combined_confidence"]) < 0.001
+
+    def test_unknown_fp_defaults_to_medium(self):
+        result = compute_combined_confidence(0.8, 80.0, "unknown_value")
+        assert result["llm_confidence"] == 0.5
 
 
 # ── parse_response tests ──────────────────────────────────────────────────────

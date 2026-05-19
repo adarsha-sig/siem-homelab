@@ -12,8 +12,10 @@ joblib==1.4.2
 pyod==1.1.3          # outlier detection algorithms (IsolationForest, LOF, OCSVM, etc.)
 river==0.21.2        # online/streaming ML for real-time anomaly scoring
 
-# --- LLM / Ollama ---
-ollama==0.2.1        # official Ollama Python client
+# --- LLM backends ---
+ollama==0.2.1        # local Ollama (fallback backend)
+groq                 # Groq cloud inference (default backend, llama-3.1-8b-instant)
+anthropic            # Anthropic Claude (claude-haiku-4-5-20251001)
 langchain==0.2.3
 langchain-community==0.2.3
 
