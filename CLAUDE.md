@@ -2,8 +2,9 @@
 
 ## What this project is
 A lean security ML research lab for detecting threats using machine learning
-and LLM-based analyst augmentation. Single Ubuntu VM running four Docker
-containers: Elasticsearch (data), Jupyter (ML), Ollama (LLM), Streamlit (UI).
+and LLM-based analyst augmentation. Running on Docker Compose:
+Elasticsearch (data), Jupyter (ML), Ollama (LLM), Streamlit (UI),
+MLflow (experiment tracking), and ofelia (cron scheduler).
 
 ## Stack and versions
 - Python 3.11
@@ -17,7 +18,9 @@ containers: Elasticsearch (data), Jupyter (ML), Ollama (LLM), Streamlit (UI).
   # ollama — Local inference (no API key), model llama3.2:3b (default) or llama3.1:8b.
   #          Privacy-preserving; ~6 min/alert on CPU, ~10 s with GPU.
 - Ollama with llama3.2:3b (local fallback when LLM_BACKEND=ollama)
-- Key Python libs: elasticsearch==8.14, scikit-learn, pyod, torch, streamlit
+- MLflow :5000 — experiment tracking, param/metric/artifact store (primary audit tool)
+- Evidently — data drift + quality reports; HTML saved to data/runs/drift_YYYY-MM-DD.html
+- Key Python libs: elasticsearch==8.14, scikit-learn, pyod, torch, streamlit, mlflow, evidently
 
 ## Project layout
 soc-ml-lab/
@@ -45,6 +48,7 @@ soc-ml-lab/
 - All scripts use argparse with --dry-run and --verbose flags
 - All ES connections use ELASTIC_URL env var (default: http://localhost:9200)
 - All Ollama calls use OLLAMA_URL env var (default: http://localhost:11434)
+- MLFLOW_TRACKING_URI env var (default: http://localhost:5000) — set in Jupyter container
 - LLM_BACKEND env var: groq (default) | claude | ollama
 - GROQ_API_KEY: required when LLM_BACKEND=groq
 - ANTHROPIC_API_KEY: required when LLM_BACKEND=claude
@@ -59,6 +63,18 @@ After building any component, explain:
 2. The design choices — why you structured the code this way
 3. What to watch for — what the output tells me and how to interpret it
 4. What to try next — natural extension or experiment to run
+
+## Observability
+- **Primary audit tool**: MLflow at http://localhost:5000
+  View retrain runs, compare contamination values, inspect feature importance plots.
+  Each run logs: params (model_type, contamination, n_estimators, feature_names),
+  metrics (anomaly_count, anomaly_rate, top_score, score_p95), and artifacts
+  (isolation_forest.pkl, feature_importance.png).
+- **Drift monitoring**: Evidently — run src/monitoring/evidently_monitor.py
+  HTML report: data/runs/drift_YYYY-MM-DD.html
+  Exits 1 if >3 features drift or current event volume drops >30% vs training set.
+- The data/runs/*.json files remain as implementation detail for get_last_retrain_time()
+  (incremental scoring boundary) but are NOT the audit trail — use MLflow for that.
 
 ## Testing
 Run `pytest tests/ -v` after any change to a src/ file.

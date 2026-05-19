@@ -24,6 +24,12 @@ sentence-transformers==3.0.1
 transformers==4.41.2
 torch==2.3.1
 
+# --- Experiment tracking ---
+mlflow                   # run tracking, param/metric logging, artifact store (:5000)
+
+# --- Data monitoring ---
+evidently                # data drift and quality reports
+
 # --- Scheduling ---
 apscheduler==3.10.4
 

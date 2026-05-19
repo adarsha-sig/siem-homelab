@@ -53,13 +53,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ES_URL       = os.getenv("ELASTIC_URL", "http://localhost:9200")
-SOURCE_INDEX = "security-events-mordor"
-SCORES_INDEX = "security-scores-if"
-MODELS_DIR   = Path(__file__).resolve().parents[2] / "data" / "models"
-RUNS_DIR     = Path(__file__).resolve().parents[2] / "data" / "runs"
-BULK_SIZE    = 500
-MAX_EVENTS   = 50_000
+ES_URL          = os.getenv("ELASTIC_URL", "http://localhost:9200")
+MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+SOURCE_INDEX    = "security-events-mordor"
+SCORES_INDEX    = "security-scores-if"
+MODELS_DIR      = Path(__file__).resolve().parents[2] / "data" / "models"
+PROCESSED_DIR   = Path(__file__).resolve().parents[2] / "data" / "processed"
+RUNS_DIR        = Path(__file__).resolve().parents[2] / "data" / "runs"
+BULK_SIZE       = 500
+MAX_EVENTS      = 50_000
+MLFLOW_EXPERIMENT = "soc_ml_lab"
 
 
 # ── Index management ──────────────────────────────────────────────────────────
@@ -192,6 +195,77 @@ def get_last_retrain_time() -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+# ── MLflow helpers ────────────────────────────────────────────────────────────
+
+def _feature_importance_plot(X_scaled: np.ndarray, feature_names: List[str]) -> Path:
+    import matplotlib
+    matplotlib.use("Agg")   # non-interactive; must precede pyplot import
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    """
+    Save a horizontal bar chart of mean |z-score| per feature.
+
+    Security intuition: mean |z-score| in the StandardScaler-transformed space
+    indicates which features have the widest spread across events — i.e., which
+    dimensions the IF trees use most for splitting. A feature with high mean
+    |z-score| is a strong discriminator between normal and anomalous events.
+    Tracking this plot across retrain runs in MLflow makes feature drift visible
+    at a glance: if proc_rarity suddenly loses discriminative power, the corpus
+    distribution has shifted and the model may need recalibration.
+    """
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    mean_abs_z = np.abs(X_scaled).mean(axis=0)
+    order = np.argsort(mean_abs_z)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.barh(
+        [feature_names[i] for i in order],
+        mean_abs_z[order],
+        color="steelblue",
+        edgecolor="white",
+    )
+    ax.set_xlabel("Mean |z-score| across training events")
+    ax.set_title("Feature Discriminative Power (IsolationForest training set)")
+    fig.tight_layout()
+
+    path = PROCESSED_DIR / "feature_importance.png"
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _log_to_mlflow(
+    params: dict,
+    metrics: dict,
+    tags: dict,
+    model_path: Optional[Path],
+    X_scaled: np.ndarray,
+    dry_run: bool,
+) -> None:
+    """
+    Best-effort MLflow logging — silently skips if the server is unreachable.
+
+    All MLflow calls are wrapped in a single try/except so a down tracking
+    server never blocks a retrain. The run is logged atomically inside
+    mlflow.start_run() so a crash mid-log leaves a partial run (visible in
+    the UI as 'FAILED') rather than corrupting the metric store.
+    """
+    try:
+        import mlflow  # noqa: PLC0415 — lazy to keep module importable without mlflow
+        mlflow.set_tracking_uri(MLFLOW_URI)
+        mlflow.set_experiment(MLFLOW_EXPERIMENT)
+        with mlflow.start_run():
+            mlflow.log_params(params)
+            mlflow.log_metrics(metrics)
+            mlflow.set_tags(tags)
+            if not dry_run and model_path and model_path.exists():
+                mlflow.log_artifact(str(model_path), artifact_path="model")
+                plot_path = _feature_importance_plot(X_scaled, FEATURE_NAMES)
+                mlflow.log_artifact(str(plot_path), artifact_path="plots")
+        log.info("MLflow run logged to %s (experiment: %s)", MLFLOW_URI, MLFLOW_EXPERIMENT)
+    except Exception as exc:
+        log.warning("MLflow logging skipped — server unreachable or error: %s", exc)
 
 
 # ── IF-specific scoring helpers ───────────────────────────────────────────────
@@ -479,16 +553,52 @@ def _run_if(
     X  = df.values.astype(np.float32)
     log.info("Feature matrix shape: %s", X.shape)
 
-    model, scaler = train(X, contamination=contamination)
+    # Persist reference feature matrix for Evidently drift monitoring.
+    # Evidently compares this training snapshot against future event windows
+    # to detect when the feature distribution shifts away from the training baseline.
+    if not dry_run:
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        with open(PROCESSED_DIR / "train_features.pkl", "wb") as f:
+            pickle.dump(df, f)
+        log.info("Training feature matrix saved to data/processed/train_features.pkl")
+
+    n_estimators = 200
+    model, scaler = train(X, contamination=contamination, n_estimators=n_estimators)
     scores, is_anomaly, percentiles, top_features = compute_scores(model, scaler, X)
+    X_scaled = scaler.transform(X)   # needed for feature importance plot
     n_flagged = int(is_anomaly.sum())
     log.info("Scored %d events: %d anomalies (%.1f%%)",
              len(events), n_flagged, 100 * n_flagged / len(events))
 
     written = write_scores(client, events, scores, is_anomaly, dry_run, verbose,
                            percentiles, top_features)
+    model_path = None
     if not dry_run:
-        save_model(model, scaler, FEATURE_NAMES)
+        model_path = save_model(model, scaler, FEATURE_NAMES)
+
+    # Log run to MLflow. Best-effort — does not block or fail the pipeline.
+    _log_to_mlflow(
+        params={
+            "model_type":    "isolation_forest",
+            "contamination": contamination,
+            "n_estimators":  n_estimators,
+            "feature_names": json.dumps(FEATURE_NAMES),
+        },
+        metrics={
+            "anomaly_count": n_flagged,
+            "anomaly_rate":  round(n_flagged / len(events), 4),
+            "top_score":     float(scores.max()),
+            "score_p95":     float(np.percentile(scores, 95)),
+        },
+        tags={
+            "dataset":         SOURCE_INDEX,
+            "event_count":     str(len(events)),
+            "score_threshold": str(contamination),
+        },
+        model_path=model_path,
+        X_scaled=X_scaled,
+        dry_run=dry_run,
+    )
 
     return {"events_scored": len(events), "anomalies_found": n_flagged,
             "contamination": contamination, "written": written,
