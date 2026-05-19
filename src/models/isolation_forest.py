@@ -14,10 +14,12 @@ Expected data flow:
                                                       →  security-scores-if
 
 Usage:
-  python src/models/isolation_forest.py               # train and score all events
-  python src/models/isolation_forest.py --dry-run     # score without ES writes
-  python src/models/isolation_forest.py --verbose     # log top anomalies
+  python src/models/isolation_forest.py                        # full retrain + score all
+  python src/models/isolation_forest.py --dry-run              # preview without ES writes
+  python src/models/isolation_forest.py --verbose              # log top anomalies
   python src/models/isolation_forest.py --contamination 0.05
+  python src/models/isolation_forest.py --score-only           # load saved model, score new events only
+  python src/models/isolation_forest.py --score-only --since 2020-09-21T00:00:00Z
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import pickle
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -52,6 +55,7 @@ ES_URL        = os.getenv("ELASTIC_URL", "http://localhost:9200")
 SOURCE_INDEX  = "security-events-mordor"
 SCORES_INDEX  = "security-scores-if"
 MODELS_DIR    = Path(__file__).resolve().parents[2] / "data" / "models"
+RUNS_DIR      = Path(__file__).resolve().parents[2] / "data" / "runs"
 BULK_SIZE     = 500
 MAX_EVENTS    = 50_000
 
@@ -237,6 +241,68 @@ def load_model(path: Path | None = None) -> tuple[IsolationForest, StandardScale
     return bundle["model"], bundle["scaler"], bundle["feature_names"]
 
 
+# ── Incremental scoring helpers ───────────────────────────────────────────────
+
+def get_last_retrain_time() -> Optional[str]:
+    """
+    Return the completed_at timestamp of the most recent successful retrain run.
+
+    Security intuition: the audit trail in data/runs/ is the source of truth
+    for 'what did the model last see'. Using it as the incremental scoring
+    boundary means we never score the same event twice and never skip an event
+    because of a clock skew between the scheduler and ES.
+
+    Skips dry-run records (they didn't actually write to ES) and records with
+    errors (the model state may be undefined after a failed retrain).
+    """
+    if not RUNS_DIR.exists():
+        return None
+    files = sorted(RUNS_DIR.glob("retrain_*.json"), reverse=True)
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if not data.get("dry_run") and not data.get("errors") and data.get("completed_at"):
+                return data["completed_at"]
+        except Exception:
+            continue
+    return None
+
+
+def fetch_new_events(
+    client: Elasticsearch,
+    since_iso: str,
+    max_events: int = MAX_EVENTS,
+) -> list[dict]:
+    """
+    Fetch only events with @timestamp strictly after since_iso.
+
+    Security intuition: incremental scoring means the nightly job processes
+    only the day's new telemetry rather than re-scoring 30k historical events.
+    On a live system receiving thousands of events per minute, this is what
+    makes the pipeline operationally viable — retrain nightly, score
+    continuously throughout the day.
+
+    Note: for historical datasets like Mordor (all events from 2020), pass
+    --since 2020-09-20T00:00:00Z to score a specific day's events.
+    """
+    log.info("Fetching events newer than %s ...", since_iso)
+    events = []
+    for hit in helpers.scan(
+        client,
+        index=SOURCE_INDEX,
+        # helpers.scan's `query` param is the full search body, not just the
+        # query clause — wrap it in {"query": ...} accordingly.
+        query={"query": {"range": {"@timestamp": {"gt": since_iso}}}},
+        _source_excludes=["_raw"],
+        size=1000,
+    ):
+        events.append(hit)
+        if len(events) >= max_events:
+            break
+    log.info("Fetched %d new events since %s", len(events), since_iso)
+    return events
+
+
 # ── ES write ──────────────────────────────────────────────────────────────────
 
 def _score_doc(
@@ -323,15 +389,77 @@ def run(
     verbose: bool = False,
     contamination: float = 0.05,
     max_events: int = MAX_EVENTS,
+    score_only: bool = False,
+    since: Optional[str] = None,
 ) -> dict:
     """
-    Full training and scoring pipeline. Returns a summary dict.
+    Training + scoring pipeline, or incremental score-only mode.
+
+    score_only=True: load the saved model, fetch only events newer than
+    `since` (or the last successful retrain timestamp from data/runs/),
+    and score them without retraining. Skips model save. Runs in seconds
+    rather than minutes on a live stream.
+
+    score_only=False (default): full retrain on all indexed events,
+    scores everything, saves the model. Use this nightly.
 
     Importable by the scheduler and notebooks without triggering CLI parsing.
     """
+    # ── Score-only path ──────────────────────────────────────────────────────
+    if score_only:
+        # Validate local preconditions before touching ES so the error
+        # messages are fast and the function is testable without a cluster.
+        model_path = MODELS_DIR / "isolation_forest.pkl"
+        if not model_path.exists():
+            raise RuntimeError(
+                f"No saved model at {model_path}. "
+                "Run without --score-only first to train and save a model."
+            )
+        model, scaler, _ = load_model(model_path)
+
+        effective_since = since or get_last_retrain_time()
+        if not effective_since:
+            raise RuntimeError(
+                "Cannot determine the scoring window: no --since provided and "
+                "no successful retrain found in data/runs/. "
+                "Run a full retrain first, or pass --since ISO_TIMESTAMP."
+            )
+
+        # Local checks passed — now create the ES client.
+        client = Elasticsearch(ES_URL)
+        ensure_source_exists(client)
+        if not dry_run:
+            ensure_scores_index(client)
+
+        events = fetch_new_events(client, effective_since, max_events=max_events)
+        if not events:
+            log.info("No new events since %s — nothing to score.", effective_since)
+            return {
+                "events_scored": 0, "anomalies_found": 0,
+                "since": effective_since, "score_only": True, "dry_run": dry_run,
+            }
+
+        df = build_feature_matrix(events)
+        X  = df.values.astype(np.float32)
+        scores, is_anomaly = compute_scores(model, scaler, X)
+        n_flagged = int(is_anomaly.sum())
+        log.info(
+            "Score-only: %d new events, %d anomalies (%.1f%%)",
+            len(events), n_flagged, 100 * n_flagged / max(len(events), 1),
+        )
+        written = write_scores(client, events, scores, is_anomaly, dry_run, verbose)
+        return {
+            "events_scored":   len(events),
+            "anomalies_found": n_flagged,
+            "since":           effective_since,
+            "written":         written,
+            "score_only":      True,
+            "dry_run":         dry_run,
+        }
+
+    # ── Full retrain path ────────────────────────────────────────────────────
     client = Elasticsearch(ES_URL)
     ensure_source_exists(client)
-
     if not dry_run:
         ensure_scores_index(client)
 
@@ -366,10 +494,11 @@ def run(
         save_model(model, scaler, FEATURE_NAMES)
 
     return {
-        "events_scored":  len(events),
+        "events_scored":   len(events),
         "anomalies_found": n_flagged,
         "contamination":   contamination,
         "written":         written,
+        "score_only":      False,
         "dry_run":         dry_run,
     }
 
@@ -396,6 +525,24 @@ def main() -> None:
         "--max-events", type=int, default=MAX_EVENTS, metavar="N",
         help=f"Maximum events to fetch from ES (default: {MAX_EVENTS}).",
     )
+    parser.add_argument(
+        "--score-only", action="store_true",
+        help=(
+            "Load the saved model and score only NEW events — no retraining. "
+            "Requires a model saved by a previous full run. "
+            "Uses the last successful retrain timestamp from data/runs/ as the "
+            "event window boundary unless --since is also provided."
+        ),
+    )
+    parser.add_argument(
+        "--since", metavar="ISO_TIMESTAMP",
+        help=(
+            "Score only events with @timestamp after this value. "
+            "Example: --since 2020-09-21T00:00:00Z. "
+            "Only used with --score-only. Defaults to the completed_at of the "
+            "most recent successful retrain in data/runs/."
+        ),
+    )
     args = parser.parse_args()
 
     summary = run(
@@ -403,6 +550,8 @@ def main() -> None:
         verbose=args.verbose,
         contamination=args.contamination,
         max_events=args.max_events,
+        score_only=args.score_only,
+        since=args.since,
     )
     if summary:
         print("\nSummary:")

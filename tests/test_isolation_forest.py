@@ -221,6 +221,96 @@ class TestTrainAndScore:
         )
 
 
+# ── Incremental scoring unit tests ───────────────────────────────────────────
+
+class TestGetLastRetrainTime:
+    def test_returns_none_when_runs_dir_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path / "nonexistent")
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() is None
+
+    def test_returns_none_when_no_retrain_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() is None
+
+    def test_returns_none_when_only_dry_run_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        (tmp_path / "retrain_20240519_020000.json").write_text(
+            '{"dry_run": true, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
+            encoding="utf-8",
+        )
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() is None
+
+    def test_returns_none_when_run_had_errors(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        (tmp_path / "retrain_20240519_020000.json").write_text(
+            '{"dry_run": false, "errors": ["boom"], "completed_at": "2024-05-19T02:01:00Z"}',
+            encoding="utf-8",
+        )
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() is None
+
+    def test_returns_completed_at_from_valid_run(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        (tmp_path / "retrain_20240519_020000.json").write_text(
+            '{"dry_run": false, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
+            encoding="utf-8",
+        )
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
+
+    def test_returns_most_recent_when_multiple_files(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        good = '{"dry_run": false, "errors": [], "completed_at": "%s"}'
+        (tmp_path / "retrain_20240518_020000.json").write_text(
+            good % "2024-05-18T02:01:00Z", encoding="utf-8"
+        )
+        (tmp_path / "retrain_20240519_020000.json").write_text(
+            good % "2024-05-19T02:01:00Z", encoding="utf-8"
+        )
+        from src.models.isolation_forest import get_last_retrain_time
+        # Should return the most recent
+        assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
+
+    def test_skips_malformed_json(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        (tmp_path / "retrain_20240518_020000.json").write_text("{not json}", encoding="utf-8")
+        (tmp_path / "retrain_20240519_020000.json").write_text(
+            '{"dry_run": false, "errors": [], "completed_at": "2024-05-19T02:01:00Z"}',
+            encoding="utf-8",
+        )
+        from src.models.isolation_forest import get_last_retrain_time
+        assert get_last_retrain_time() == "2024-05-19T02:01:00Z"
+
+
+class TestScoreOnlyRun:
+    def test_score_only_raises_without_saved_model(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("src.models.isolation_forest.MODELS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path)
+        from src.models.isolation_forest import run
+        with pytest.raises(RuntimeError, match="No saved model"):
+            run(score_only=True, since="2024-01-01T00:00:00Z", dry_run=True)
+
+    def test_score_only_raises_without_since_and_no_audit(self, tmp_path, monkeypatch):
+        # Create a fake model file so the first check passes
+        import pickle
+        from sklearn.ensemble import IsolationForest
+        from sklearn.preprocessing import StandardScaler
+        model_path = tmp_path / "isolation_forest.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(
+                {"model": IsolationForest(), "scaler": StandardScaler(), "feature_names": []},
+                f,
+            )
+        monkeypatch.setattr("src.models.isolation_forest.MODELS_DIR", tmp_path)
+        monkeypatch.setattr("src.models.isolation_forest.RUNS_DIR", tmp_path / "empty_runs")
+        from src.models.isolation_forest import run
+        with pytest.raises(RuntimeError, match="Cannot determine the scoring window"):
+            run(score_only=True, dry_run=True)
+
+
 # ── Integration tests (require live ES + populated index) ─────────────────────
 
 @pytest.mark.integration

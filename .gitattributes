@@ -1,0 +1,28 @@
+# Normalise line endings to LF in the repo; check out as LF on all platforms.
+# This prevents CRLF contamination of Python files and Docker configs on Windows,
+# which can break shebangs, COPY instructions, and JSON parsing.
+* text=auto eol=lf
+
+# Explicitly text (always LF)
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.ini       text eol=lf
+*.cfg       text eol=lf
+*.toml      text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Binaries — never modify
+*.pkl  binary
+*.zip  binary
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.pdf  binary

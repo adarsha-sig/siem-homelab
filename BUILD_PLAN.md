@@ -44,6 +44,18 @@
 - [x] tests/test_nightly_retrain.py — 18/18 unit tests pass; all tests use tmp_path, no real data/runs/ writes during CI
 - Full test suite: 61/61 unit tests pass (test_isolation_forest + test_alert_explainer + test_nightly_retrain)
 
+## Phase 7 — Incremental scoring + Windows portability ✅ COMPLETE
+- [x] isolation_forest.py: --score-only flag loads saved model, queries events after last audit timestamp
+- [x] isolation_forest.py: get_last_retrain_time() reads data/runs/retrain_*.json (skips dry-run and error runs)
+- [x] isolation_forest.py: fetch_new_events() adds @timestamp range filter to helpers.scan
+- [x] isolation_forest.py: --since ISO_TIMESTAMP override for historical datasets
+- [x] tests/test_isolation_forest.py: 8 new unit tests for get_last_retrain_time + score_only error paths (70/70 total)
+- [x] Verified: --score-only --since 2020-09-20T00:00:00Z → 21,940 events scored in seconds (vs 3 min full retrain)
+- [x] .gitattributes: LF enforcement for all text files, binary markers for .pkl/.zip
+- [x] Makefile: all common tasks with PowerShell equivalents in comments
+- [x] WINDOWS_SETUP.md: step-by-step Docker Desktop + WSL2 setup, PowerShell equivalents, troubleshooting
+- [x] README.md: complete rewrite — architecture, all scripts, feature table, LLM triage fields, scheduler, Windows note
+
 ## Current phase: complete
-## Last completed: Phase 6 — Scheduler and retrain loop
+## Last completed: Phase 7 — Incremental scoring + Windows portability
 ## Blockers: none
