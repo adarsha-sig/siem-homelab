@@ -88,6 +88,26 @@ SCORES_MAPPING = {
                     "category": {"type": "keyword"},
                     "id":       {"type": "keyword"},
                     "channel":  {"type": "keyword"},
+                    "mitre":    {"properties": {"technique": {"type": "keyword"}}},
+                }
+            },
+            # Wazuh-native fields preserved by wazuh_bridge.py for Path A routing
+            "wazuh": {
+                "properties": {
+                    "rule": {
+                        "properties": {
+                            "id":          {"type": "keyword"},
+                            "description": {"type": "text"},
+                            "level":       {"type": "integer"},
+                            "groups":      {"type": "keyword"},
+                        }
+                    },
+                    "agent": {
+                        "properties": {
+                            "id":   {"type": "keyword"},
+                            "name": {"type": "keyword"},
+                        }
+                    },
                 }
             },
             "source_dataset": {"type": "keyword"},
@@ -104,6 +124,7 @@ SCORES_MAPPING = {
                     "combined_confidence": {"type": "float"},
                     "llm_confidence":      {"type": "float"},
                     "if_llm_disagreement": {"type": "boolean"},
+                    "enrichment_path":     {"type": "keyword"},   # "A" = Wazuh-backed, "B" = full prompt
                     # stored but not indexed — use ml.enriched for queries
                     "llm_triage":          {"type": "object", "enabled": False},
                     # stored but not indexed — top feature list per event

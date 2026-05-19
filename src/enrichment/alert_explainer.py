@@ -66,7 +66,7 @@ DEFAULT_MODEL  = OLLAMA_MODEL   # kept for backward-compat with existing callers
 
 DEFAULT_LIMIT  = 50
 
-# Required keys in the LLM JSON response.
+# Required keys in the LLM JSON response — full prompt (Path B).
 _REQUIRED_KEYS = {
     "attack_technique",
     "attack_tactic",
@@ -75,6 +75,8 @@ _REQUIRED_KEYS = {
     "fp_reasoning",
     "investigation_steps",
 }
+# Path A (Wazuh-backed): ATT&CK already known, only need FP assessment + steps.
+_REQUIRED_KEYS_PATH_A = {"fp_assessment", "fp_reasoning", "investigation_steps"}
 _VALID_FP = {"low", "medium", "high"}
 
 # fp_assessment → llm_confidence (confidence that this is a TRUE POSITIVE).
@@ -119,9 +121,12 @@ def fetch_unenriched_anomalies(
             "_source": [
                 "@timestamp", "host.name", "user.name",
                 "process.name", "process.parent.name", "process.command_line",
-                "event.category", "event.channel", "event.id",
+                "event.category", "event.channel", "event.id", "event.mitre.technique",
                 "source_dataset",
                 "ml.anomaly_score", "ml.anomaly_percentile", "ml.top_features",
+                # Wazuh fields — present only on events bridged from Wazuh;
+                # their existence triggers the cheaper Path A enrichment prompt.
+                "wazuh.rule.id", "wazuh.rule.description", "wazuh.rule.groups",
             ],
         },
     )
@@ -130,10 +135,15 @@ def fetch_unenriched_anomalies(
     return hits
 
 
-def write_triage(client: Elasticsearch, doc_id: str, triage: dict) -> None:
+def write_triage(client: Elasticsearch, doc_id: str, triage: dict, enrichment_path: str = "B") -> None:
     """
-    Patch ml.llm_triage and ml.enriched onto an existing document via Painless.
+    Patch ml.llm_triage, ml.enriched, and ml.enrichment_path via Painless.
     Does NOT touch ml.anomaly_score, ml.is_anomaly, or any other ml.* field.
+
+    enrichment_path:
+      "A" — Wazuh-backed: ATT&CK was pre-populated from rule.mitre; LLM only
+            provided fp_assessment and investigation_steps (shorter, cheaper).
+      "B" — Full prompt: LLM classified the ATT&CK technique from scratch.
     """
     client.update(
         index=SCORES_INDEX,
@@ -141,10 +151,11 @@ def write_triage(client: Elasticsearch, doc_id: str, triage: dict) -> None:
         script={
             "source": (
                 "ctx._source.ml.llm_triage = params.triage; "
-                "ctx._source.ml.enriched = true"
+                "ctx._source.ml.enriched = true; "
+                "ctx._source.ml.enrichment_path = params.path"
             ),
             "lang":   "painless",
-            "params": {"triage": triage},
+            "params": {"triage": triage, "path": enrichment_path},
         },
     )
 
@@ -241,6 +252,64 @@ def _format_top_features(top_features: Optional[list]) -> str:
         direction = "above" if z > 0 else "below"
         parts.append(f"{feat['feature']} (z={z:+.2f}, {direction} baseline)")
     return "; ".join(parts)
+
+
+def _wazuh_technique(src: dict) -> Optional[str]:
+    """Extract ATT&CK technique ID from a Wazuh-sourced event, or None."""
+    # Try event.mitre.technique (set by wazuh_bridge.py)
+    t = (src.get("event") or {}).get("mitre", {}).get("technique")
+    if t:
+        return t
+    # Fallback: wazuh.rule groups sometimes contain technique IDs
+    return None
+
+
+def build_prompt_path_a(src: dict, wazuh_rule_id: str, wazuh_description: str) -> str:
+    """
+    Shorter enrichment prompt for Wazuh-backed alerts (Path A).
+
+    Security intuition: Wazuh rules already encode ATT&CK technique mappings
+    written by the Wazuh threat research team. Asking the LLM to re-classify
+    technique from raw fields wastes tokens and introduces noise. Path A
+    trusts the Wazuh ATT&CK label and only asks the LLM for two things that
+    Wazuh rules cannot provide: a contextual false-positive assessment (does
+    this specific event instance look real given the environment?) and concrete
+    investigation steps (what should the analyst do right now?).
+    This cuts prompt length by ~60% and LLM cost proportionally.
+    """
+    proc   = (src.get("process") or {}).get("name") or "unknown"
+    host   = (src.get("host") or {}).get("name") or "unknown"
+    user   = (src.get("user") or {}).get("name") or "unknown"
+    ml     = src.get("ml") or {}
+    score  = ml.get("anomaly_score", 0)
+    pct    = ml.get("anomaly_percentile")
+    pct_str = f"{pct:.1f}th percentile" if pct is not None else "high percentile"
+
+    return f"""You are a SOC analyst. Wazuh rule {wazuh_rule_id} fired on this event:
+"{wazuh_description}"
+
+Event context:
+  process: {proc}
+  host: {host}
+  user: {user}
+  ml.anomaly_score: {score:.4f} ({pct_str}) — this event is statistically unusual for this specific environment
+
+ATT&CK technique: already determined by Wazuh rule. Your job is ONLY to assess:
+1. Is this a true positive or false positive in this specific context?
+2. What are the 3 most important investigation steps for an analyst right now?
+
+Respond ONLY with valid JSON (no markdown, no explanation outside JSON):
+{{
+  "fp_assessment": "low | medium | high",
+  "fp_reasoning":  "One sentence explaining your FP assessment for THIS specific event",
+  "investigation_steps": [
+    "Step 1: concrete immediate action",
+    "Step 2: ...",
+    "Step 3: ..."
+  ]
+}}
+
+JSON only:"""
 
 
 def build_prompt(src: dict) -> str:
@@ -371,11 +440,16 @@ def call_llm(prompt: str, backend: str, model: str) -> str:
     return resp["message"]["content"]
 
 
-def parse_response(raw: str) -> Optional[dict]:
+def parse_response(raw: str, required_keys: Optional[set] = None) -> Optional[dict]:
     """
     Extract and validate the JSON triage object from the LLM response.
     Handles markdown code fences and leading prose gracefully.
+
+    required_keys defaults to _REQUIRED_KEYS (Path B / full prompt).
+    Pass _REQUIRED_KEYS_PATH_A for the shorter Wazuh-backed prompt.
     """
+    if required_keys is None:
+        required_keys = _REQUIRED_KEYS
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -392,7 +466,7 @@ def parse_response(raw: str) -> Optional[dict]:
         log.warning("JSON parse failed: %s", exc)
         return None
 
-    missing = _REQUIRED_KEYS - set(obj.keys())
+    missing = required_keys - set(obj.keys())
     if missing:
         log.warning("LLM response missing keys: %s", missing)
         return None
@@ -408,6 +482,25 @@ def parse_response(raw: str) -> Optional[dict]:
     obj["investigation_steps"] = [str(s) for s in steps[:5]]
 
     return obj
+
+
+# ── Wazuh routing helpers ─────────────────────────────────────────────────────
+
+def _tactic_from_groups(groups: list) -> str:
+    """Derive ATT&CK tactic name from Wazuh rule group labels."""
+    groups_lower = " ".join(str(g).lower() for g in groups)
+    if "lateral" in groups_lower:          return "Lateral Movement"
+    if "privilege" in groups_lower:        return "Privilege Escalation"
+    if "credential" in groups_lower:       return "Credential Access"
+    if "execution" in groups_lower:        return "Execution"
+    if "persistence" in groups_lower:      return "Persistence"
+    if "discovery" in groups_lower:        return "Discovery"
+    if "collection" in groups_lower:       return "Collection"
+    if "exfiltration" in groups_lower:     return "Exfiltration"
+    if "command" in groups_lower:          return "Command and Control"
+    if "defense" in groups_lower:          return "Defense Evasion"
+    if "initial" in groups_lower:          return "Initial Access"
+    return "Unknown"
 
 
 # ── Per-alert enrichment ──────────────────────────────────────────────────────
@@ -443,30 +536,56 @@ def enrich_one(
         backend,
     )
 
-    prompt = build_prompt(src)
+    pct_str = f"{pct:.1f}" if pct is not None else "?"
+
+    # ── Path A / Path B routing ───────────────────────────────────────────────
+    # Path A: event has a Wazuh rule ID → ATT&CK technique already known.
+    #         Send shorter prompt asking only for fp_assessment + investigation_steps.
+    # Path B: no Wazuh backing → full prompt; LLM classifies technique from scratch.
+    wazuh_rule    = (src.get("wazuh") or {}).get("rule") or {}
+    wazuh_rule_id = str(wazuh_rule.get("id") or "").strip()
+    wazuh_desc    = wazuh_rule.get("description") or ""
+    mitre_tech    = _wazuh_technique(src)
+
+    if wazuh_rule_id:
+        enrichment_path = "A"
+        prompt          = build_prompt_path_a(src, wazuh_rule_id, wazuh_desc)
+        required_keys   = _REQUIRED_KEYS_PATH_A
+        log.info("  → Path A (Wazuh rule %s, technique %s)", wazuh_rule_id, mitre_tech or "unknown")
+    else:
+        enrichment_path = "B"
+        prompt          = build_prompt(src)
+        required_keys   = _REQUIRED_KEYS
+        log.info("  → Path B (full ATT&CK classification)")
 
     try:
-        raw = call_llm(prompt, backend, model)
+        raw_resp = call_llm(prompt, backend, model)
     except Exception as exc:
         log.error("%s call failed for %s: %s", backend, doc_id[:8], exc)
         return None
 
     if verbose:
-        log.info("Raw LLM response:\n%s", raw)
+        log.info("Raw LLM response:\n%s", raw_resp)
 
-    triage = parse_response(raw)
+    triage = parse_response(raw_resp, required_keys=required_keys)
     if triage is None:
         log.warning("Skipping %s — could not parse LLM response", doc_id[:8])
         return None
 
+    # Path A: fill in ATT&CK fields from Wazuh so the triage dict has a
+    # consistent shape regardless of which path produced it.
+    if enrichment_path == "A":
+        triage.setdefault("attack_technique", mitre_tech or f"wazuh:{wazuh_rule_id}")
+        triage.setdefault("attack_tactic",    _tactic_from_groups(wazuh_rule.get("groups") or []))
+        triage.setdefault("description",      f"Wazuh rule {wazuh_rule_id}: {wazuh_desc}")
+
     confidence = compute_combined_confidence(score, pct, triage["fp_assessment"])
 
     if dry_run:
-        pct_str = f"{pct:.1f}" if pct is not None else "?"
-        print(f"\n  [{doc_id[:8]}] score={score:.4f}  pct={pct_str}  proc={proc}")
-        print(f"    technique : {triage['attack_technique']}  ({triage['attack_tactic']})")
+        print(f"\n  [{doc_id[:8]}] path={enrichment_path}  score={score:.4f}  pct={pct_str}  proc={proc}")
+        print(f"    technique : {triage.get('attack_technique','?')}  ({triage.get('attack_tactic','?')})")
         print(f"    fp        : {triage['fp_assessment']} — {triage['fp_reasoning']}")
-        print(f"    summary   : {triage['description']}")
+        print(f"    summary   : {triage.get('description','—')}")
         print(
             f"    combined  : {confidence['combined_confidence']:.4f}"
             f"  llm_conf={confidence['llm_confidence']}"
@@ -478,13 +597,13 @@ def enrich_one(
     else:
         es = client_from_env()
         try:
-            write_triage(es, doc_id, triage)
+            write_triage(es, doc_id, triage, enrichment_path=enrichment_path)
             write_combined_confidence(es, doc_id, confidence)
         except Exception as exc:
             log.error("ES write failed for %s: %s", doc_id[:8], exc)
             return None
 
-    return {**triage, **confidence}
+    return {**triage, **confidence, "enrichment_path": enrichment_path}
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────

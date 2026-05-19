@@ -64,6 +64,24 @@ After building any component, explain:
 3. What to watch for — what the output tells me and how to interpret it
 4. What to try next — natural extension or experiment to run
 
+## Wazuh integration
+- Stack file: docker-compose.wazuh.yml (separate compose file, shares homelabsiem_soc_net)
+- Start: docker compose -f docker-compose.wazuh.yml up -d
+- Dashboard: https://localhost (port 443) — admin/admin
+- Wazuh API: https://localhost:55000
+- Alert index in our ES: wazuh-alerts-4.x-* (written by Wazuh manager filebeat)
+- ECS copy for ML pipeline: security-events-wazuh (written by wazuh_bridge.py every 5 min)
+- Bridge cursor: data/runs/wazuh_bridge_cursor.json (last-seen timestamp)
+
+## Two-path LLM enrichment (alert_explainer.py)
+- Path A — Wazuh-backed: alert has wazuh.rule.id → ATT&CK technique pre-populated
+  from Wazuh rule, LLM asked ONLY for fp_assessment + investigation_steps.
+  ~60% shorter prompt, lower LLM cost. ml.enrichment_path = "A".
+- Path B — Full prompt: no Wazuh rule → LLM classifies ATT&CK technique from scratch.
+  ml.enrichment_path = "B".
+- ml.enrichment_path is indexed as keyword; use it to measure ML novelty:
+  alerts with path="B" that are anomalous = things ML found that Wazuh missed.
+
 ## Observability
 - **Primary audit tool**: MLflow at http://localhost:5000
   View retrain runs, compare contamination values, inspect feature importance plots.

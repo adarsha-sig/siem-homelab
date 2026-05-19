@@ -104,6 +104,10 @@ services:
       ofelia.job-exec.drift.schedule: "0 4 * * *"
       ofelia.job-exec.drift.command: >
         python3 /home/jovyan/work/src/monitoring/evidently_monitor.py
+      # Wazuh alert bridge — poll every 5 minutes for new alerts
+      ofelia.job-exec.wazuh-bridge.schedule: "*/5 * * * *"
+      ofelia.job-exec.wazuh-bridge.command: >
+        python3 /home/jovyan/work/src/ingest/wazuh_bridge.py
 
   # ── Cron scheduler ───────────────────────────────────────────────────────────
   # ofelia reads the ofelia.job-exec.* labels on soc_jupyter and exec-s the

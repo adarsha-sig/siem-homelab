@@ -1,0 +1,113 @@
+# Wazuh single-node stack — attaches to the main soc_net so the Wazuh manager's
+# internal filebeat can write alerts directly to our Elasticsearch instance.
+#
+# Start with: docker compose -f docker-compose.wazuh.yml up -d
+#
+# Compatibility note: Wazuh 4.x filebeat uses an index template designed for
+# OpenSearch 2.x. Elasticsearch 8.14 accepts it for basic write operations but
+# some Wazuh dashboard panels (security_monitoring_*) may not render correctly
+# because they rely on OpenSearch-specific aggregation plugins. The alert data
+# itself (wazuh-alerts-4.x-*) indexes and queries correctly via wazuh_bridge.py.
+#
+# Ports exposed:
+#   1514/UDP — Wazuh agent events
+#   1515     — Wazuh agent auto-registration
+#   55000    — Wazuh REST API
+#   443      — Wazuh dashboard (https://localhost)
+
+services:
+
+  # ── Wazuh Manager ─────────────────────────────────────────────────────────
+  # The manager receives events from Wazuh agents, applies YARA/Sigma/custom
+  # rules, generates alerts, and ships them to the indexer via filebeat.
+  # We redirect filebeat to our Elasticsearch by overriding INDEXER_URL.
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.7.3
+    hostname: wazuh.manager
+    container_name: wazuh_manager
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    ports:
+      - "1514:1514/udp"   # agent syslog events
+      - "1515:1515"       # agent auto-registration
+      - "514:514/udp"     # syslog ingest
+      - "55000:55000"     # Wazuh REST API
+    environment:
+      # Redirect filebeat output to our Elasticsearch instead of Wazuh Indexer.
+      # xpack.security.enabled=false means credentials are ignored by ES, but
+      # filebeat still requires non-empty values in its config template.
+      - INDEXER_URL=http://elasticsearch:9200
+      - WAZUH_INDEXER_URL=http://elasticsearch:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=admin
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      # API credentials for the Wazuh dashboard to query the manager
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=MyS3cr37P450r.*-
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - filebeat_etc:/etc/filebeat
+      - filebeat_var:/var/lib/filebeat
+    networks:
+      - soc_net   # joins the main stack so filebeat can reach soc_elasticsearch
+
+  # ── Wazuh Dashboard ───────────────────────────────────────────────────────
+  # OpenSearch Dashboards variant with Wazuh plugins. Connects to:
+  #   - Our Elasticsearch on soc_net for index data
+  #   - Wazuh manager REST API for live stats
+  # Access: https://localhost (self-signed cert; accept in browser)
+  # Default credentials: admin / admin
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.7.3
+    hostname: wazuh.dashboard
+    container_name: wazuh_dashboard
+    restart: unless-stopped
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_URL=http://elasticsearch:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=admin
+      - WAZUH_API_URL=https://wazuh.manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=kibanaserver
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=MyS3cr37P450r.*-
+    depends_on:
+      - wazuh.manager
+    networks:
+      - soc_net
+
+networks:
+  # Attach to the pre-existing main stack network.
+  # Verify name with: docker network ls | grep soc
+  soc_net:
+    external: true
+    name: homelabsiem_soc_net
+
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  filebeat_etc:
+  filebeat_var:
