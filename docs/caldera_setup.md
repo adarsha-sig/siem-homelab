@@ -25,7 +25,8 @@ docker compose -f docker-compose.caldera.yml up -d
 docker logs -f soc_caldera
 ```
 
-Open `http://localhost:8888` — log in as **red / redpassword** (or whatever
+Open `http://localhost:8889` — log in as **red / redpassword**
+(port 8889 on the host; 8888 is already used by the Jupyter container) (or whatever
 you set for `CALDERA_RED_PASSWORD` in `.env`).
 
 ### How credentials flow
@@ -120,7 +121,7 @@ needs HTTP access to port 8888 on the Mac host.
 4. Group: **red** (the group your Sandcat agent registered with).
 5. Click **Start** and watch links execute in the UI.
 6. Copy the operation UUID from the URL bar:
-   `http://localhost:8888/#/operations/<UUID-HERE>`
+   `http://localhost:8889/#/operations/<UUID-HERE>`
 
 ---
 

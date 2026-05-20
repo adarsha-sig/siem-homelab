@@ -98,8 +98,9 @@ ES must be running for integration tests. Use --dry-run for unit tests.
 
 - Stack file: docker-compose.caldera.yml (separate compose file, shares homelabsiem_soc_net)
 - Start: docker compose -f docker-compose.caldera.yml up -d
-- UI: http://localhost:8888 — red/redpassword or blue/bluepassword
-- REST API: http://localhost:8888 (KEY: <CALDERA_API_KEY> header)
+- UI: http://localhost:8889 — red/redpassword or blue/bluepassword
+  (host port 8889; container-internal port is 8888; 8888 is taken by soc_jupyter)
+- REST API: http://localhost:8889 (KEY: <CALDERA_API_KEY> header)
 - Entrypoint script: docker/caldera/entrypoint.sh — generates conf/local.yml from env vars
   at container startup so credentials never live in the image or a mounted config file.
 - Setup doc: docs/caldera_setup.md — Windows Sandcat agent deploy, operation creation guide
@@ -112,7 +113,7 @@ ES must be running for integration tests. Use --dry-run for unit tests.
   detection_rate, avg_detection_latency_seconds, technique_results[], missed_techniques[]}
 - Environment variables (all in .env):
   CALDERA_API_KEY — injected into local.yml and used by caldera_monitor.py
-  CALDERA_URL=http://localhost:8888 (host) or http://caldera:8888 (inside jupyter container)
+  CALDERA_URL=http://localhost:8889 (host) or http://caldera:8888 (inside jupyter container)
   CALDERA_RED_PASSWORD / CALDERA_BLUE_PASSWORD — optional UI login overrides
 - Demo mode (no live CALDERA): python src/redblue/caldera_monitor.py --demo
   Writes a synthetic 3-technique scorecard so the dashboard can be tested offline.
@@ -182,6 +183,85 @@ soc-ml-lab/
 │   ├── models/            ← saved .pkl model files
 │   └── runs/              ← scorecard + cursor JSON files (NOT the audit trail)
 └── tests/                 ← pytest tests for each module
+
+## Windows migration — moving to a new PC
+
+### Moving to a new Windows PC with more RAM
+
+1. Install Docker Desktop 4.x+ with WSL2 (see WINDOWS_SETUP.md §1–2).
+2. `git clone` the repo onto the new machine.
+3. Copy your old `.env` file (or recreate from `.env.example` and re-enter keys).
+4. The `data/raw/` Mordor ZIPs and `data/processed/` files travel with the repo.
+   The trained model in `data/models/` also travels — copy or re-run `make train`.
+   Elasticsearch data is in a named Docker volume (`es_data`) and stays on the old
+   machine; re-ingest with `make ingest && make train` on the new one.
+5. Run `.\bootstrap.ps1` (or `bash bootstrap.sh --skip-wazuh` if RAM is still tight).
+
+### GPU passthrough for Ollama (NVIDIA on Windows/Linux)
+
+Add a `deploy` stanza to the `ollama` service in `docker-compose.yml` after
+installing the NVIDIA Container Toolkit on the host:
+
+```yaml
+ollama:
+  image: ollama/ollama:latest
+  ...
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+```
+
+Verify GPU is visible inside the container:
+```bash
+docker exec soc_ollama nvidia-smi
+```
+
+On Windows the host must have the CUDA-enabled NVIDIA driver (not just the gaming
+driver); see NVIDIA Container Toolkit docs for WSL2 setup.
+
+### Model upgrade from llama3.2:3b to llama3.1:8b
+
+The 3b model is the default (fast on CPU, good for interactive use). The 8b model
+gives measurably better ATT&CK technique mapping accuracy and is recommended when
+a GPU is available or latency is not critical.
+
+```bash
+# Pull the 8b model (requires ~5 GB free on the ollama_models volume)
+make pull-model-8b
+
+# Tell alert_explainer.py to use it
+# In .env add: OLLAMA_MODEL=llama3.1:8b
+# Or pass at runtime:
+docker exec soc_jupyter python3 /home/jovyan/work/src/enrichment/alert_explainer.py \
+    --backend ollama --model llama3.1:8b --limit 50
+```
+
+### Re-pointing Wazuh agents at a new host
+
+When the machine running the Wazuh manager gets a new IP address:
+
+1. Find the agent config on each monitored host:
+   - Windows: `C:\Program Files (x86)\ossec-agent\ossec.conf`
+   - Linux: `/var/ossec/etc/ossec.conf`
+2. Update the `<server>` block:
+   ```xml
+   <server>
+     <address>NEW_MANAGER_IP</address>
+     <port>1514</port>
+   </server>
+   ```
+3. Restart the Wazuh agent service:
+   - Windows: `Restart-Service -Name "OssecSvc"`
+   - Linux: `systemctl restart wazuh-agent`
+4. Confirm the agent reconnects: Wazuh dashboard → Agents → check status turns green.
+
+If the manager itself was rebuilt (new Docker volume), agents need to re-register:
+stop the agent, delete `client.keys`, restart — the manager auto-accepts the registration
+request on port 1515.
 
 ## Never do
 - Never hardcode credentials or IP addresses (use env vars)

@@ -79,6 +79,11 @@ services:
       - OLLAMA_URL=http://ollama:11434
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - SHUFFLE_WEBHOOK_URL=${SHUFFLE_WEBHOOK_URL:-}
+      # LLM backends — passed so scripts and integration tests inside the container
+      # can call Groq/Claude/Ollama without leaving the container environment.
+      - LLM_BACKEND=${LLM_BACKEND:-groq}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       # CALDERA — use container hostname so caldera_monitor.py works inside the container
       - CALDERA_URL=${CALDERA_URL:-http://caldera:8888}
       - CALDERA_API_KEY=${CALDERA_API_KEY:-}
@@ -86,6 +91,8 @@ services:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data
       - ./src:/home/jovyan/work/src
+      - ./tests:/home/jovyan/work/tests
+      - ./pytest.ini:/home/jovyan/work/pytest.ini:ro
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -94,6 +101,8 @@ services:
     networks:
       - soc_net
     labels:
+      # Required by ofelia v0.3.6+ to opt this container into scheduling.
+      ofelia.enabled: "true"
       # Retrain the IF model every night at 02:00 UTC
       ofelia.job-exec.retrain.schedule: "0 2 * * *"
       ofelia.job-exec.retrain.command: >
@@ -126,7 +135,7 @@ services:
     container_name: soc_cron
     command: daemon --docker
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - jupyter
     networks:

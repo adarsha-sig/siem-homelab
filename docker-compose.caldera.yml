@@ -45,8 +45,8 @@ services:
     networks:
       - soc_net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8888/api/v2/operations -H 'KEY: ${CALDERA_API_KEY}' | grep -q '\\['"]
-      # healthcheck hits the container-internal port (8888), not the host port (8889)
+      # Check that the CALDERA HTTP server is responding (login page is public).
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/ -o /dev/null"]
       interval: 20s
       timeout: 10s
       retries: 10

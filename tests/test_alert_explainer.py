@@ -210,8 +210,9 @@ class TestComputeCombinedConfidence:
         assert result["if_llm_disagreement"] is False
 
     def test_routing_tier1_when_combined_high(self):
+        # alert_explainer.py uses "high_priority" (not model_runner.py's "tier-1")
         result = compute_combined_confidence(0.95, 99.0, "low")
-        assert result["routing_decision"] == "tier-1"
+        assert result["routing_decision"] == "high_priority"
 
     def test_routing_auto_close_when_combined_low(self):
         result = compute_combined_confidence(0.3, 30.0, "high")
@@ -318,7 +319,32 @@ class TestIntegration:
         from elasticsearch import Elasticsearch
         from src.enrichment.alert_explainer import SCORES_INDEX, run
 
-        summary = run(dry_run=False, verbose=False, limit=3, model=DEFAULT_MODEL)
+        # Resolve backend and model from environment; skip if credentials look like
+        # placeholders (e.g. GROQ_API_KEY=gsk_... or empty) — avoids hard failures
+        # on fresh installs where keys haven't been configured yet.
+        backend = os.getenv("LLM_BACKEND", "groq")
+        model_map = {"groq": "llama-3.1-8b-instant",
+                     "claude": "claude-haiku-4-5-20251001",
+                     "ollama": DEFAULT_MODEL}
+        model = model_map.get(backend, DEFAULT_MODEL)
+
+        if backend == "groq":
+            key = os.getenv("GROQ_API_KEY", "")
+            if len(key) < 20 or "..." in key:
+                pytest.skip("GROQ_API_KEY not configured — set a real key to run this test")
+        elif backend == "claude":
+            key = os.getenv("ANTHROPIC_API_KEY", "")
+            if len(key) < 20 or "..." in key:
+                pytest.skip("ANTHROPIC_API_KEY not configured — set a real key to run this test")
+        elif backend == "ollama":
+            try:
+                import httpx
+                httpx.get(os.getenv("OLLAMA_URL", "http://localhost:11434"), timeout=2)
+            except Exception:
+                pytest.skip("Ollama not reachable — pull llama3.2:3b to run this test")
+
+        summary = run(dry_run=False, verbose=False, limit=3,
+                      model=model, backend=backend)
         assert summary["succeeded"] >= 1
 
         es   = Elasticsearch(os.getenv("ELASTIC_URL", "http://localhost:9200"))

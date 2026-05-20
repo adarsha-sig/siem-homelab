@@ -337,6 +337,7 @@ class TestIntegration:
     """
 
     def test_scores_index_created_and_populated(self):
+        import os
         from elasticsearch import Elasticsearch
         from src.models.model_runner import SCORES_INDEX, run
 
