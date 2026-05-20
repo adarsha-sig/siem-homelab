@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 # ── Environment defaults ──────────────────────────────────────────────────────
 
 ES_URL         = os.getenv("ELASTIC_URL",    "http://localhost:9200")
-CALDERA_URL    = os.getenv("CALDERA_URL",    "http://localhost:8888")
+CALDERA_URL    = os.getenv("CALDERA_URL",    "http://localhost:8889")
 CALDERA_KEY    = os.getenv("CALDERA_API_KEY", "")
 SCORES_INDEX   = "security-scores-if"
 RUNS_DIR       = Path(__file__).resolve().parents[2] / "data" / "runs"
