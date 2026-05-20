@@ -22,7 +22,7 @@ services:
   # rules, generates alerts, and ships them to the indexer via filebeat.
   # We redirect filebeat to our Elasticsearch by overriding INDEXER_URL.
   wazuh.manager:
-    image: wazuh/wazuh-manager:4.7.3
+    image: wazuh/wazuh-manager:4.14.5
     hostname: wazuh.manager
     container_name: wazuh_manager
     restart: unless-stopped
@@ -72,7 +72,7 @@ services:
   # Access: https://localhost (self-signed cert; accept in browser)
   # Default credentials: admin / admin
   wazuh.dashboard:
-    image: wazuh/wazuh-dashboard:4.7.3
+    image: wazuh/wazuh-dashboard:4.14.5
     hostname: wazuh.dashboard
     container_name: wazuh_dashboard
     restart: unless-stopped
