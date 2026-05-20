@@ -226,9 +226,9 @@ def compute_combined_confidence(
     disagreement = bool(float(if_score) > 0.8 and llm_conf < 0.3)
 
     if combined >= 0.7:
-        routing = "tier-1"
+        routing = "high_priority"
     elif combined >= 0.4:
-        routing = "tier-2"
+        routing = "analyst_review"
     else:
         routing = "auto-close"
 

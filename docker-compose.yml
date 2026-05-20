@@ -108,6 +108,10 @@ services:
       ofelia.job-exec.wazuh-bridge.schedule: "*/5 * * * *"
       ofelia.job-exec.wazuh-bridge.command: >
         python3 /home/jovyan/work/src/ingest/wazuh_bridge.py
+      # Shuffle SOAR notifier — forward high-priority alerts every 5 minutes
+      ofelia.job-exec.shuffle-notify.schedule: "*/5 * * * *"
+      ofelia.job-exec.shuffle-notify.command: >
+        python3 /home/jovyan/work/src/response/shuffle_notifier.py
 
   # ── Cron scheduler ───────────────────────────────────────────────────────────
   # ofelia reads the ofelia.job-exec.* labels on soc_jupyter and exec-s the
@@ -148,9 +152,93 @@ services:
     networks:
       - soc_net
 
+  # ── Shuffle SOAR ─────────────────────────────────────────────────────────────
+  # Open-source SOAR platform for automated incident response workflows.
+  # UI: http://localhost:3001 — first login creates the admin account.
+  #
+  # shuffle-database is Shuffle's private OpenSearch instance. It is NOT
+  # exposed on the host to avoid colliding with soc_elasticsearch on :9200.
+  # Ports:
+  #   3001 — Shuffle web UI (HTTP)
+  #   3443 — Shuffle web UI (HTTPS, self-signed)
+  #   5001 — Shuffle backend API (used by shuffle_notifier.py webhook POSTs)
+  shuffle-database:
+    image: opensearchproject/opensearch:2.14.0
+    container_name: shuffle_database
+    hostname: shuffle-database
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - DISABLE_SECURITY_PLUGIN=true
+    volumes:
+      - shuffle_db:/usr/share/opensearch/data
+    networks:
+      - soc_net
+    restart: unless-stopped
+
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: shuffle_backend
+    hostname: shuffle-backend
+    ports:
+      - "5001:5001"
+    environment:
+      - SHUFFLE_ELASTIC=true
+      - SHUFFLE_OPENSEARCH_URL=http://shuffle-database:9200
+      - DATASTORE_EMULATOR_HOST=shuffle-database:8001
+      - BASE_URL=http://localhost
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - ORG_ID=Shuffle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shuffle_apps:/shuffle-apps
+      - shuffle_files:/shuffle-files
+    depends_on:
+      - shuffle-database
+    networks:
+      - soc_net
+    restart: unless-stopped
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle_frontend
+    hostname: shuffle-frontend
+    ports:
+      - "3001:80"
+      - "3443:443"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+    depends_on:
+      - shuffle-backend
+    networks:
+      - soc_net
+    restart: unless-stopped
+
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: shuffle_orborus
+    hostname: shuffle-orborus
+    environment:
+      - ORG_ID=Shuffle
+      - ENVIRONMENT_NAME=Shuffle
+      - BASE_URL=http://shuffle-backend:5001
+      - DOCKER_API_VERSION=1.40
+      - CLEANUP=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - shuffle-backend
+    networks:
+      - soc_net
+    restart: unless-stopped
+
 volumes:
   es_data:
   ollama_models:
+  shuffle_db:
+  shuffle_apps:
+  shuffle_files:
 
 networks:
   soc_net:
