@@ -79,6 +79,9 @@ services:
       - OLLAMA_URL=http://ollama:11434
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - SHUFFLE_WEBHOOK_URL=${SHUFFLE_WEBHOOK_URL:-}
+      # CALDERA — use container hostname so caldera_monitor.py works inside the container
+      - CALDERA_URL=${CALDERA_URL:-http://caldera:8888}
+      - CALDERA_API_KEY=${CALDERA_API_KEY:-}
     volumes:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data

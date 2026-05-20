@@ -96,7 +96,13 @@ ES must be running for integration tests. Use --dry-run for unit tests.
 
 ## CALDERA red/blue simulation integration
 
-- Setup doc: docs/caldera_setup.md — git clone, pip install, server start, Windows agent deploy
+- Stack file: docker-compose.caldera.yml (separate compose file, shares homelabsiem_soc_net)
+- Start: docker compose -f docker-compose.caldera.yml up -d
+- UI: http://localhost:8888 — red/redpassword or blue/bluepassword
+- REST API: http://localhost:8888 (KEY: <CALDERA_API_KEY> header)
+- Entrypoint script: docker/caldera/entrypoint.sh — generates conf/local.yml from env vars
+  at container startup so credentials never live in the image or a mounted config file.
+- Setup doc: docs/caldera_setup.md — Windows Sandcat agent deploy, operation creation guide
 - Monitor script: src/redblue/caldera_monitor.py
   Polls GET /api/v2/operations/{id}/links every 30 s
   For each completed link: records technique_id and timestamp, then queries
@@ -104,9 +110,10 @@ ES must be running for integration tests. Use --dry-run for unit tests.
   Writes scorecard to data/runs/live_detection_YYYY-MM-DD.json
 - Scorecard schema: {operation, operation_name, techniques_executed, detected, missed,
   detection_rate, avg_detection_latency_seconds, technique_results[], missed_techniques[]}
-- Environment variables:
-  CALDERA_URL=http://localhost:8888 (or host IP visible from your terminal)
-  CALDERA_API_KEY=<api_key_red value from conf/local.yml>
+- Environment variables (all in .env):
+  CALDERA_API_KEY — injected into local.yml and used by caldera_monitor.py
+  CALDERA_URL=http://localhost:8888 (host) or http://caldera:8888 (inside jupyter container)
+  CALDERA_RED_PASSWORD / CALDERA_BLUE_PASSWORD — optional UI login overrides
 - Demo mode (no live CALDERA): python src/redblue/caldera_monitor.py --demo
   Writes a synthetic 3-technique scorecard so the dashboard can be tested offline.
 - Detection threshold: ml.anomaly_score ≥ 0.5 within 90 s counts as "detected".

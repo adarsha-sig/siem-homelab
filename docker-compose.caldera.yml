@@ -1,0 +1,54 @@
+# CALDERA adversary emulation platform — attaches to the main soc_net.
+#
+# Start:  docker compose -f docker-compose.caldera.yml up -d
+# Stop:   docker compose -f docker-compose.caldera.yml down
+#
+# Prerequisites:
+#   1. Main stack must be running (docker-compose.yml up -d) so soc_net exists.
+#   2. Set CALDERA_API_KEY in .env (copy from .env.example if absent).
+#
+# UI:     http://localhost:8888  (red / redpassword, blue / bluepassword)
+# API:    http://localhost:8888  (KEY: <CALDERA_API_KEY> header)
+#
+# Port 8888 must be reachable from the Windows victim VM so the Sandcat agent
+# can phone home. On macOS: System Settings → Firewall → allow incoming on 8888,
+# or temporarily disable the firewall during a red team exercise.
+#
+# From inside the jupyter container caldera_monitor.py reaches CALDERA at
+# http://caldera:8888 (container hostname on soc_net).
+
+services:
+
+  caldera:
+    image: mitre/caldera:latest
+    container_name: soc_caldera
+    hostname: caldera
+    restart: unless-stopped
+    ports:
+      - "8888:8888"    # web UI + REST API
+    environment:
+      - CALDERA_API_KEY=${CALDERA_API_KEY:?Set CALDERA_API_KEY in .env}
+      - CALDERA_RED_PASSWORD=${CALDERA_RED_PASSWORD:-redpassword}
+      - CALDERA_BLUE_PASSWORD=${CALDERA_BLUE_PASSWORD:-bluepassword}
+    volumes:
+      - ./docker/caldera/entrypoint.sh:/entrypoint.sh:ro
+      - caldera_data:/usr/src/app/data         # operation results, agent state
+      - caldera_plugins:/usr/src/app/plugins   # plugin data persisted across restarts
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    networks:
+      - soc_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/api/v2/operations -H 'KEY: ${CALDERA_API_KEY}' | grep -q '\\['"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+networks:
+  soc_net:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME:-homelabsiem}_soc_net
+
+volumes:
+  caldera_data:
+  caldera_plugins:
