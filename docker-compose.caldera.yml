@@ -7,11 +7,11 @@
 #   1. Main stack must be running (docker-compose.yml up -d) so soc_net exists.
 #   2. Set CALDERA_API_KEY in .env (copy from .env.example if absent).
 #
-# UI:     http://localhost:8888  (red / redpassword, blue / bluepassword)
-# API:    http://localhost:8888  (KEY: <CALDERA_API_KEY> header)
+# UI:     http://localhost:8889  (red / redpassword, blue / bluepassword)
+# API:    http://localhost:8889  (KEY: <CALDERA_API_KEY> header)
 #
-# Port 8888 must be reachable from the Windows victim VM so the Sandcat agent
-# can phone home. On macOS: System Settings → Firewall → allow incoming on 8888,
+# Port 8889 must be reachable from the Windows victim VM so the Sandcat agent
+# can phone home. On macOS: System Settings → Firewall → allow incoming on 8889,
 # or temporarily disable the firewall during a red team exercise.
 #
 # From inside the jupyter container caldera_monitor.py reaches CALDERA at
@@ -25,20 +25,28 @@ services:
     hostname: caldera
     restart: unless-stopped
     ports:
-      - "8888:8888"    # web UI + REST API
+      - "8889:8888"    # web UI + REST API (8888 is taken by soc_jupyter)
     environment:
       - CALDERA_API_KEY=${CALDERA_API_KEY:?Set CALDERA_API_KEY in .env}
       - CALDERA_RED_PASSWORD=${CALDERA_RED_PASSWORD:-redpassword}
       - CALDERA_BLUE_PASSWORD=${CALDERA_BLUE_PASSWORD:-bluepassword}
+      - CALDERA_CRYPT_SALT=${CALDERA_CRYPT_SALT:-homelabsalt}
+      - CALDERA_ENCRYPTION_KEY=${CALDERA_ENCRYPTION_KEY:-homelabkey}
+      # Set CALDERA_CONTACT_URL to your Mac's LAN IP:8889 so Sandcat agents
+      # deployed to the Windows VM know where to phone home.
+      - CALDERA_CONTACT_URL=${CALDERA_CONTACT_URL:-http://0.0.0.0:8888}
     volumes:
       - ./docker/caldera/entrypoint.sh:/entrypoint.sh:ro
       - caldera_data:/usr/src/app/data         # operation results, agent state
       - caldera_plugins:/usr/src/app/plugins   # plugin data persisted across restarts
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    # No --insecure flag: that forces default.yml and ignores local.yml.
+    # ssl: false in local.yml (written by entrypoint.sh) disables TLS instead.
     networks:
       - soc_net
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8888/api/v2/operations -H 'KEY: ${CALDERA_API_KEY}' | grep -q '\\['"]
+      # healthcheck hits the container-internal port (8888), not the host port (8889)
       interval: 20s
       timeout: 10s
       retries: 10
