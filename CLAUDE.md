@@ -22,28 +22,6 @@ MLflow (experiment tracking), and ofelia (cron scheduler).
 - Evidently — data drift + quality reports; HTML saved to data/runs/drift_YYYY-MM-DD.html
 - Key Python libs: elasticsearch==8.14, scikit-learn, pyod, torch, streamlit, mlflow, evidently
 
-## Project layout
-soc-ml-lab/
-├── CLAUDE.md              ← you are here
-├── SPEC.md                ← full feature spec, read before building anything
-├── BUILD_PLAN.md          ← phased milestones, check current phase before starting
-├── docker-compose.yml
-├── docker/
-│   ├── jupyter/Dockerfile
-│   └── streamlit/Dockerfile
-├── src/
-│   ├── ingest/            ← data loading and ES indexing scripts
-│   ├── models/            ← ML model training and scoring scripts
-│   ├── enrichment/        ← LLM-based alert enrichment
-│   ├── dashboard/         ← Streamlit app
-│   └── scheduler/         ← cron jobs
-├── notebooks/             ← Jupyter exploration notebooks
-├── data/
-│   ├── raw/               ← downloaded datasets, never modified
-│   ├── processed/         ← feature-engineered outputs
-│   └── models/            ← saved .pkl model files
-└── tests/                 ← pytest tests for each module
-
 ## Coding conventions
 - All scripts use argparse with --dry-run and --verbose flags
 - All ES connections use ELASTIC_URL env var (default: http://localhost:9200)
@@ -115,6 +93,88 @@ After building any component, explain:
 ## Testing
 Run `pytest tests/ -v` after any change to a src/ file.
 ES must be running for integration tests. Use --dry-run for unit tests.
+
+## CALDERA red/blue simulation integration
+
+- Setup doc: docs/caldera_setup.md — git clone, pip install, server start, Windows agent deploy
+- Monitor script: src/redblue/caldera_monitor.py
+  Polls GET /api/v2/operations/{id}/links every 30 s
+  For each completed link: records technique_id and timestamp, then queries
+  security-scores-if for anomalies on that host within 90 s of execution.
+  Writes scorecard to data/runs/live_detection_YYYY-MM-DD.json
+- Scorecard schema: {operation, operation_name, techniques_executed, detected, missed,
+  detection_rate, avg_detection_latency_seconds, technique_results[], missed_techniques[]}
+- Environment variables:
+  CALDERA_URL=http://localhost:8888 (or host IP visible from your terminal)
+  CALDERA_API_KEY=<api_key_red value from conf/local.yml>
+- Demo mode (no live CALDERA): python src/redblue/caldera_monitor.py --demo
+  Writes a synthetic 3-technique scorecard so the dashboard can be tested offline.
+- Detection threshold: ml.anomaly_score ≥ 0.5 within 90 s counts as "detected".
+  Override with --detection-threshold and --detect-window flags.
+
+## Red/Blue simulation loop
+
+The full adversary emulation → ML detection → coverage gap → improve cycle:
+
+```
+1. SIMULATE   — Run a CALDERA operation (choose an adversary profile, target the
+                Windows victim VM, click Start in the CALDERA UI)
+
+2. DETECT     — The Isolation Forest scores events in security-scores-if every
+                5 min (ofelia cron). Wazuh bridge copies Wazuh alerts to ES.
+
+3. SCORE      — caldera_monitor.py correlates each technique execution with ES
+                anomaly events, records detected/missed per technique.
+                Output: data/runs/live_detection_YYYY-MM-DD.json
+
+4. COVERAGE   — Streamlit Tab 2 (Coverage Gap) reads the scorecard and shows:
+                · Detection rate + avg latency KPIs
+                · Per-technique table (green = detected, red = missed)
+                · LLM one-sentence suggestion for each missed technique
+
+5. IMPROVE    — For each missed technique:
+                a. Follow the LLM suggestion (add Wazuh rule, add feature to
+                   feature_engineering.py, adjust contamination param).
+                b. Re-run src/models/model_runner.py --retrain to update the model.
+                c. MLflow at http://localhost:5000 tracks the retrain run.
+
+6. REPEAT     — Run another CALDERA operation (same adversary or a harder one)
+                and watch the detection rate climb.
+```
+
+Measuring progress: compare detection_rate across scorecard files in data/runs/.
+A technique that was "missed" and becomes "detected" after a model update is a
+confirmed detection engineering improvement. Logged in MLflow as a metric.
+
+## Project layout (updated)
+soc-ml-lab/
+├── CLAUDE.md              ← you are here
+├── SPEC.md                ← full feature spec, read before building anything
+├── BUILD_PLAN.md          ← phased milestones, check current phase before starting
+├── docker-compose.yml
+├── docker/
+│   ├── jupyter/Dockerfile
+│   └── streamlit/Dockerfile
+├── src/
+│   ├── ingest/            ← data loading and ES indexing scripts
+│   ├── models/            ← ML model training and scoring scripts
+│   ├── enrichment/        ← LLM-based alert enrichment
+│   ├── dashboard/         ← Streamlit app
+│   ├── redblue/           ← CALDERA red/blue simulation scripts
+│   │   └── caldera_monitor.py
+│   ├── response/          ← Shuffle SOAR notifier
+│   ├── monitoring/        ← Evidently drift monitor
+│   └── scheduler/         ← cron jobs
+├── docs/
+│   ├── caldera_setup.md   ← CALDERA install + agent deploy guide
+│   └── shuffle_workflow_setup.md
+├── notebooks/             ← Jupyter exploration notebooks
+├── data/
+│   ├── raw/               ← downloaded datasets, never modified
+│   ├── processed/         ← feature-engineered outputs
+│   ├── models/            ← saved .pkl model files
+│   └── runs/              ← scorecard + cursor JSON files (NOT the audit trail)
+└── tests/                 ← pytest tests for each module
 
 ## Never do
 - Never hardcode credentials or IP addresses (use env vars)

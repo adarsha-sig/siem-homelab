@@ -365,36 +365,216 @@ with tab_queue:
 
 # ══ Tab 2: Coverage Gap ═══════════════════════════════════════════════════════
 
+# ── LLM suggestion for missed techniques (Coverage Gap) ───────────────────────
+
+def _suggest_for_missed(technique_id: str) -> str:
+    """
+    Ask the configured LLM for a one-sentence feature/rule suggestion for a
+    missed ATT&CK technique.
+
+    Security intuition: when the Isolation Forest misses a technique, the gap
+    is usually that the relevant telemetry either is not being collected or does
+    not look statistically unusual in the training data. The LLM knows the
+    ATT&CK technique catalogue and can suggest the most distinctive observable
+    (e.g. 'monitor for file deletion of event logs' for T1070.004), pointing
+    the analyst toward the right Wazuh rule or feature engineering target.
+    """
+    prompt = (
+        f"You are a SOC detection engineer. The Isolation Forest model missed "
+        f"ATT&CK technique {technique_id}. In one sentence, what specific "
+        f"Windows event log field, process behaviour, or Wazuh rule would most "
+        f"reliably catch this technique? Be concrete — name the event ID or "
+        f"feature name if possible."
+    )
+    backend = os.getenv("LLM_BACKEND", "groq")
+    try:
+        if backend == "groq":
+            from groq import Groq
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=150,
+            )
+            return resp.choices[0].message.content.strip()
+        if backend == "claude":
+            import anthropic
+            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text.strip()
+        # ollama fallback
+        import ollama as _ollama
+        oc   = _ollama.Client(host=os.getenv("OLLAMA_URL", "http://localhost:11434"))
+        resp = oc.chat(
+            model=os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0},
+        )
+        return resp["message"]["content"].strip()
+    except Exception as exc:
+        return f"(LLM unavailable: {exc})"
+
+
+def load_latest_scorecard() -> Optional[dict]:
+    """
+    Read the most recent live_detection_YYYY-MM-DD.json from data/runs/.
+
+    Returns None if no scorecard exists yet. Picking the alphabetically
+    last filename gives the most recent date without parsing every file.
+    """
+    runs_dir = Path(__file__).resolve().parents[2] / "data" / "runs"
+    files    = sorted(runs_dir.glob("live_detection_*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text())
+    except Exception:
+        return None
+
+
 with tab_coverage:
-    st.subheader("Coverage Gap Analysis")
-    st.info(
-        "**Coming in Phase 8 — CALDERA integration.**\n\n"
-        "This panel will show which ATT&CK techniques were exercised by "
-        "CALDERA adversary emulation and which are NOT yet covered by the "
-        "Isolation Forest model — the 'gap' between what you can simulate "
-        "and what the model actually detects.\n\n"
-        "Planned columns: technique ID · tactic · simulated? · detected? "
-        "· detection rate · top false-negative events."
-    )
+    import json
+    st.subheader("Coverage Gap — Live CALDERA Scorecard")
 
-    # Stub chart — replaced with real CALDERA data in Phase 8
-    import pandas as pd
-    stub = pd.DataFrame({
-        "Tactic":    ["Initial Access", "Execution", "Persistence",
-                      "Privilege Escalation", "Defense Evasion",
-                      "Credential Access", "Lateral Movement"],
-        "Techniques": [3, 8, 5, 4, 7, 6, 4],
-        "Covered":    [0, 3, 0, 1, 2, 4, 2],
-    })
-    stub["Gap"] = stub["Techniques"] - stub["Covered"]
+    scorecard = load_latest_scorecard()
 
-    fig = px.bar(
-        stub, x="Tactic", y=["Covered", "Gap"],
-        title="ATT&CK Coverage by Tactic (stub — replace with CALDERA data)",
-        labels={"value": "Techniques", "variable": ""},
-        color_discrete_map={"Covered": "#2ecc71", "Gap": "#e74c3c"},
-        barmode="stack",
-    )
-    fig.update_layout(xaxis_tickangle=-20)
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("Data is placeholder. Phase 8 will populate this from CALDERA operation results.")
+    if scorecard is None:
+        st.info(
+            "No CALDERA scorecard found yet.\n\n"
+            "Run a CALDERA operation and then:\n"
+            "```\npython src/redblue/caldera_monitor.py --operation-id <UUID>\n```\n"
+            "Or try the demo:\n"
+            "```\npython src/redblue/caldera_monitor.py --demo\n```"
+        )
+        stub = pd.DataFrame({
+            "Tactic":    ["Initial Access", "Execution", "Persistence",
+                          "Privilege Escalation", "Defense Evasion",
+                          "Credential Access", "Lateral Movement"],
+            "Techniques": [3, 8, 5, 4, 7, 6, 4],
+            "Covered":    [0, 3, 0, 1, 2, 4, 2],
+        })
+        stub["Gap"] = stub["Techniques"] - stub["Covered"]
+        fig = px.bar(
+            stub, x="Tactic", y=["Covered", "Gap"],
+            title="ATT&CK Coverage by Tactic (placeholder — run CALDERA to populate)",
+            labels={"value": "Techniques", "variable": ""},
+            color_discrete_map={"Covered": "#2ecc71", "Gap": "#e74c3c"},
+            barmode="stack",
+        )
+        fig.update_layout(xaxis_tickangle=-20)
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        # ── Summary KPIs ──────────────────────────────────────────────────────
+        op_name  = scorecard.get("operation_name", scorecard.get("operation", "—"))
+        gen_at   = scorecard.get("generated_at", "")
+        n_exec   = scorecard.get("techniques_executed", 0)
+        n_det    = scorecard.get("detected", 0)
+        n_miss   = scorecard.get("missed", 0)
+        rate     = scorecard.get("detection_rate", 0)
+        avg_lat  = scorecard.get("avg_detection_latency_seconds")
+        is_demo  = scorecard.get("demo", False)
+
+        if is_demo:
+            st.caption("Demo scorecard — run a real CALDERA operation to replace this.")
+
+        st.caption(f"Operation: **{op_name}** · Generated: {gen_at[:19].replace('T', ' ')} UTC")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Techniques Run",    n_exec)
+        c2.metric("Detected",          n_det,
+                  f"{rate:.0%}",
+                  delta_color="normal")
+        c3.metric("Missed",            n_miss,
+                  f"-{n_miss}" if n_miss else "0",
+                  delta_color="inverse")
+        c4.metric("Avg Detection Latency",
+                  f"{avg_lat:.1f} s" if avg_lat is not None else "—")
+
+        st.divider()
+
+        # ── Per-technique table ───────────────────────────────────────────────
+        tech_results = scorecard.get("technique_results", [])
+        if tech_results:
+            rows = []
+            for r in tech_results:
+                rows.append({
+                    "Technique":  r["technique_id"],
+                    "Ability":    r["ability_name"],
+                    "Host":       r["hostname"],
+                    "Detected":   r["detected"],
+                    "Max Score":  r["max_score"] if r["detected"] else None,
+                    "Latency (s)": r["detection_latency_seconds"],
+                    "Events":     r["detecting_events"],
+                })
+            tech_df = pd.DataFrame(rows)
+
+            st.dataframe(
+                tech_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Technique": st.column_config.TextColumn("Technique", width="small"),
+                    "Ability":   st.column_config.TextColumn("Ability"),
+                    "Host":      st.column_config.TextColumn("Host", width="small"),
+                    "Detected":  st.column_config.CheckboxColumn(
+                        "Detected",
+                        width="small",
+                        help="Green = ML model flagged an anomaly within the detection window.",
+                    ),
+                    "Max Score": st.column_config.ProgressColumn(
+                        "Max Score", min_value=0, max_value=1, format="%.4f",
+                    ),
+                    "Latency (s)": st.column_config.NumberColumn(
+                        "Latency (s)", format="%.1f",
+                        help="Seconds from technique execution to first ML detection.",
+                    ),
+                    "Events": st.column_config.NumberColumn("Events", width="small"),
+                },
+            )
+
+        # ── Coverage pie chart ────────────────────────────────────────────────
+        if n_exec > 0:
+            pie_df = pd.DataFrame({
+                "Status": ["Detected", "Missed"],
+                "Count":  [n_det, n_miss],
+            })
+            fig = px.pie(
+                pie_df, names="Status", values="Count",
+                color="Status",
+                color_discrete_map={"Detected": "#2ecc71", "Missed": "#e74c3c"},
+                title=f"Detection Coverage — {rate:.0%} of techniques detected",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Missed-technique LLM suggestions ─────────────────────────────────
+        missed = scorecard.get("missed_techniques", [])
+        if missed:
+            st.divider()
+            st.subheader(f"Coverage Gap — {len(missed)} missed technique(s)")
+            st.caption(
+                "For each missed technique the LLM suggests one feature or rule "
+                "that would most likely catch it. Use these as prioritised items "
+                "for your next detection engineering sprint."
+            )
+            for tid in missed:
+                with st.expander(f"🔴 {tid} — improvement suggestion", expanded=True):
+                    # Find the ability name from technique_results
+                    ability = next(
+                        (r["ability_name"] for r in tech_results if r["technique_id"] == tid),
+                        "",
+                    )
+                    if ability:
+                        st.caption(f"Ability: {ability}")
+                    cache_key = f"suggest_{tid}"
+                    if cache_key not in st.session_state:
+                        with st.spinner(f"Asking LLM about {tid}…"):
+                            st.session_state[cache_key] = _suggest_for_missed(tid)
+                    st.markdown(f"> {st.session_state[cache_key]}")
+        else:
+            st.success("All techniques were detected — no coverage gaps in this operation.")
