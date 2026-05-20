@@ -1,0 +1,13 @@
+server.host: 0.0.0.0
+server.ssl.enabled: false
+
+# Point at the main stack Elasticsearch (no auth, no TLS in our local-only setup).
+# The dashboard uses the keystore for opensearch.username/password (set by entrypoint).
+opensearch.hosts: ["http://elasticsearch:9200"]
+opensearch.ssl.verificationMode: none
+# Bypass the strict OpenSearch version check — our backend is Elasticsearch 8.14,
+# not OpenSearch, so the version string check always fails without this flag.
+opensearch.ignoreVersionMismatch: true
+
+# Land users on the Wazuh home page instead of the generic Dashboards landing.
+uiSettings.overrides.defaultRoute: /app/wz-home
