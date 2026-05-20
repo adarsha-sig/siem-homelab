@@ -94,10 +94,13 @@ services:
 
 networks:
   # Attach to the pre-existing main stack network.
-  # Verify name with: docker network ls | grep soc
+  # The name is {compose_project_name}_soc_net. Docker derives the project name
+  # from the directory name (lowercased, non-alphanumeric chars stripped).
+  # Verify the exact name before starting: docker network ls | grep soc
+  # If it differs, set COMPOSE_PROJECT_NAME=homelabsiem when starting the main stack.
   soc_net:
     external: true
-    name: homelabsiem_soc_net
+    name: ${COMPOSE_PROJECT_NAME:-homelabsiem}_soc_net
 
 volumes:
   wazuh_api_configuration:

@@ -78,6 +78,7 @@ services:
       - ELASTIC_URL=http://elasticsearch:9200
       - OLLAMA_URL=http://ollama:11434
       - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - SHUFFLE_WEBHOOK_URL=${SHUFFLE_WEBHOOK_URL:-}
     volumes:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data
@@ -190,6 +191,9 @@ services:
       - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
       - SHUFFLE_FILE_LOCATION=/shuffle-files
       - ORG_ID=Shuffle
+      - SHUFFLE_DEFAULT_USERNAME=${SHUFFLE_DEFAULT_USERNAME:-admin}
+      - SHUFFLE_DEFAULT_PASSWORD=${SHUFFLE_DEFAULT_PASSWORD}
+      - SHUFFLE_ENCRYPTION_MODIFIER=${SHUFFLE_ENCRYPTION_MODIFIER}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - shuffle_apps:/shuffle-apps
@@ -223,7 +227,7 @@ services:
       - ORG_ID=Shuffle
       - ENVIRONMENT_NAME=Shuffle
       - BASE_URL=http://shuffle-backend:5001
-      - DOCKER_API_VERSION=1.40
+      - DOCKER_API_VERSION=1.44
       - CLEANUP=true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

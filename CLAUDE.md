@@ -52,6 +52,10 @@ soc-ml-lab/
 - LLM_BACKEND env var: groq (default) | claude | ollama
 - GROQ_API_KEY: required when LLM_BACKEND=groq
 - ANTHROPIC_API_KEY: required when LLM_BACKEND=claude
+- SHUFFLE_WEBHOOK_URL: required for shuffle_notifier.py; set to
+  http://shuffle-backend:5001/api/v1/hooks/<hook-id> (container hostname, not localhost,
+  because the notifier runs inside the jupyter container on soc_net).
+  Create the hook in the Shuffle UI: Triggers → Webhook → copy the URL.
 - Log with Python logging module, not print (except CLI output)
 - Every script must be runnable standalone AND importable as a module
 - Write a brief docstring on every function explaining the security intuition,
@@ -72,6 +76,20 @@ After building any component, explain:
 - Alert index in our ES: wazuh-alerts-4.x-* (written by Wazuh manager filebeat)
 - ECS copy for ML pipeline: security-events-wazuh (written by wazuh_bridge.py every 5 min)
 - Bridge cursor: data/runs/wazuh_bridge_cursor.json (last-seen timestamp)
+
+## Shuffle SOAR integration
+- Services: shuffle-database (OpenSearch, internal only), shuffle-backend (:5001),
+  shuffle-frontend (:3001 HTTP / :3443 HTTPS), shuffle-orborus (workflow executor)
+- UI: http://localhost:3001 — first login creates the admin account
+- Backend API: http://localhost:5001 (host) / http://shuffle-backend:5001 (container-to-container)
+- Notifier script: src/response/shuffle_notifier.py — runs every 5 min via ofelia
+  Polls security-scores-if for routing_decision IN (high_priority, analyst_review)
+  that have ml.shuffle_notified != true, POSTs each to SHUFFLE_WEBHOOK_URL, then
+  marks ml.shuffle_notified=true for idempotency.
+- To wire up: create a Webhook trigger in the Shuffle UI, copy the URL, set
+  SHUFFLE_WEBHOOK_URL=http://shuffle-backend:5001/api/v1/hooks/<hook-id> in .env
+- Credentials and SHUFFLE_WEBHOOK_URL must come from .env (see .env.example) —
+  never hardcode them in docker-compose.yml
 
 ## Two-path LLM enrichment (alert_explainer.py)
 - Path A — Wazuh-backed: alert has wazuh.rule.id → ATT&CK technique pre-populated
